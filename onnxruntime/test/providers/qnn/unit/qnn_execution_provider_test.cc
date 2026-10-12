@@ -617,6 +617,31 @@ TEST_F(QnnUnit_ExecutionProviderTest, Ctor_EnableVtcmBackupBufferSharing_Succeed
   EXPECT_NO_THROW({ auto ep = MakeEp(*factory, ctx); });
 }
 
+TEST_F(QnnUnit_ExecutionProviderTest, Ctor_StopSharingRetainsAdoptedBackendManager) {
+  EpStubContext producer_ctx;
+  producer_ctx.session_config[EPKey("htp_share_resource_optimization")] = "1";
+  auto producer_factory = MakeFactory(producer_ctx);
+  auto producer_ep = MakeEp(*producer_factory, producer_ctx);
+
+  auto shared_manager = SharedContext::GetInstance().GetSharedQnnBackendManager();
+  ASSERT_NE(shared_manager, nullptr);
+  std::weak_ptr<qnn::QnnBackendManager> manager_lifetime = shared_manager;
+  shared_manager.reset();
+
+  EpStubContext consumer_ctx;
+  consumer_ctx.session_config[EPKey("htp_share_resource_optimization")] = "1";
+  consumer_ctx.session_config["ep.stop_share_ep_contexts"] = "1";
+  auto consumer_factory = MakeFactory(consumer_ctx);
+  auto consumer_ep = MakeEp(*consumer_factory, consumer_ctx);
+
+  EXPECT_EQ(SharedContext::GetInstance().GetSharedQnnBackendManager(), nullptr);
+  producer_ep.reset();
+  EXPECT_FALSE(manager_lifetime.expired());
+
+  consumer_ep.reset();
+  EXPECT_TRUE(manager_lifetime.expired());
+}
+
 TEST_F(QnnUnit_ExecutionProviderTest, Ctor_DeviceIdNegative_LogsWarning) {
   EpStubContext ctx;
   ctx.log_severity = ORT_LOGGING_LEVEL_VERBOSE;

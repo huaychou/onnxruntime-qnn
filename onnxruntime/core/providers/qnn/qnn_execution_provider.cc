@@ -1484,12 +1484,16 @@ QnnEp::QnnEp(QnnEpFactory& factory,
                                                     false,
                                                     logger_);
 
-  // For context binary generation with weight sharing enabled, use the QnnBackendManager from the shared context if it exits
-  // So that all graphs from later sessions will be compiled into the same QNN context
-  if (
-      ((context_cache_enabled_ && share_ep_contexts_) || htp_share_resource_optimization_ == 1) &&
-      SharedContext::GetInstance().GetSharedQnnBackendManager()) {
-    qnn_backend_manager_ = SharedContext::GetInstance().GetSharedQnnBackendManager();
+  // For context binary generation with weight sharing enabled, use the QnnBackendManager from the shared context if it exists
+  // so that all graphs from later sessions will be compiled into the same QNN context. Keep the result from a single lookup:
+  // another session may clear the singleton, but this session must retain the manager it adopted.
+  const bool should_share_backend_manager =
+      (context_cache_enabled_ && share_ep_contexts_) || htp_share_resource_optimization_ == 1;
+  auto shared_qnn_backend_manager = should_share_backend_manager
+                                        ? SharedContext::GetInstance().GetSharedQnnBackendManager()
+                                        : nullptr;
+  if (shared_qnn_backend_manager) {
+    qnn_backend_manager_ = std::move(shared_qnn_backend_manager);
     // Reset QnnBackendManager's logger to the one in current session as original one could be deleted along with the
     // previous session.
     qnn_backend_manager_->ResetLogger(logger_);

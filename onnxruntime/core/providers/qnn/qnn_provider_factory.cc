@@ -614,6 +614,23 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetCustomOpDomainsImpl(
 }  // namespace onnxruntime
 
 extern "C" {
+#if defined(_WIN32) && QNN_EP_INTERNAL_SYMBOL_ACCESS
+// OrtLoggingManager keeps its state in a header-local function static. Put
+// this test bridge in the same translation unit as the factory paths so
+// Windows internal-symbol tests update the exact logger storage they read.
+const OrtLogger* ORT_API_CALL QnnUnit_SetFactoryDefaultLoggerForTesting(
+    const OrtLogger* logger) noexcept {
+  const OrtLogger* previous = onnxruntime::OrtLoggingManager::GetDefaultLoggerPtr();
+  onnxruntime::OrtLoggingManager::SetDefaultLogger(logger);
+  return previous;
+}
+
+void ORT_API_CALL QnnUnit_RestoreFactoryDefaultLoggerForTesting(
+    const OrtLogger* previous) noexcept {
+  onnxruntime::OrtLoggingManager::SetDefaultLogger(previous);
+}
+#endif
+
 //
 // Public symbols
 //

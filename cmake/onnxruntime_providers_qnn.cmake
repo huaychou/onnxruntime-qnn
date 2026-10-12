@@ -62,6 +62,13 @@
   else()
     onnxruntime_add_shared_library_module(onnxruntime_providers_qnn ${onnxruntime_providers_qnn_all_srcs})
   endif()
+
+  if(onnxruntime_qnn_internal_ut_symbols_enabled)
+    # Keep test-only provider-side bridges available to the internal-symbol
+    # test binary without adding them to production builds.
+    target_compile_definitions(onnxruntime_providers_qnn PRIVATE QNN_EP_INTERNAL_SYMBOL_ACCESS=1)
+  endif()
+
   onnxruntime_add_include_to_target(onnxruntime_providers_qnn ${GSL_TARGET} safeint_interface nlohmann_json::nlohmann_json)
 
   target_link_libraries(onnxruntime_providers_qnn PRIVATE ${ABSEIL_LIBS})

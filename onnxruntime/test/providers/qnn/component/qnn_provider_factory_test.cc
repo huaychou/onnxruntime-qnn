@@ -51,6 +51,10 @@ OrtStatus* CreateEpFactories(const char* registration_name,
                              size_t max_factories,
                              size_t* num_factories);
 OrtStatus* ReleaseEpFactory(OrtEpFactory* factory);
+#ifdef _WIN32
+const OrtLogger* ORT_API_CALL QnnUnit_SetFactoryDefaultLoggerForTesting(const OrtLogger* logger) noexcept;
+void ORT_API_CALL QnnUnit_RestoreFactoryDefaultLoggerForTesting(const OrtLogger* previous) noexcept;
+#endif
 }
 
 namespace onnxruntime {
@@ -397,14 +401,58 @@ static OrtApiBase MakeFakeApiBase() {
   return base;
 }
 
-// Base fixture: resets the process-wide default logger to nullptr at the start
-// of each test so that HasDefaultLogger()==false is the default state. Tests
-// that need a non-null default logger call OrtLoggingManager::SetDefaultLogger
-// themselves.
+// Windows internal-symbol builds load QnnEpFactory from the provider DLL, so
+// the test executable and provider DLL have independent header-local logger
+// state. Keep both sides aligned for error-path tests that assert logger state.
+class DefaultLoggerOverride {
+ public:
+  void SetUp(const OrtLogger* logger) {
+    test_original_ = OrtLoggingManager::GetDefaultLoggerPtr();
+    OrtLoggingManager::SetDefaultLogger(logger);
+#ifdef _WIN32
+    provider_original_ = QnnUnit_SetFactoryDefaultLoggerForTesting(logger);
+#endif
+    active_ = true;
+  }
+
+  void Set(const OrtLogger* logger) {
+    OrtLoggingManager::SetDefaultLogger(logger);
+#ifdef _WIN32
+    QnnUnit_SetFactoryDefaultLoggerForTesting(logger);
+#endif
+  }
+
+  void TearDown() {
+    if (!active_) return;
+#ifdef _WIN32
+    QnnUnit_RestoreFactoryDefaultLoggerForTesting(provider_original_);
+#endif
+    OrtLoggingManager::SetDefaultLogger(test_original_);
+    active_ = false;
+  }
+
+ private:
+  const OrtLogger* test_original_ = nullptr;
+#ifdef _WIN32
+  const OrtLogger* provider_original_ = nullptr;
+#endif
+  bool active_ = false;
+};
+
+// Base fixture resets the default logger to nullptr at the start of each test.
+// Tests that need a non-null default logger use SetDefaultLoggerForTest() so
+// Windows provider-DLL state stays synchronized with the test executable.
 class QnnUnit_ProviderFactoryTest : public ::testing::Test {
  protected:
-  void SetUp() override { OrtLoggingManager::SetDefaultLogger(nullptr); }
-  void TearDown() override { OrtLoggingManager::SetDefaultLogger(nullptr); }
+  void SetUp() override { default_logger_override_.SetUp(nullptr); }
+  void TearDown() override { default_logger_override_.TearDown(); }
+
+  void SetDefaultLoggerForTest(const OrtLogger* logger) {
+    default_logger_override_.Set(logger);
+  }
+
+ private:
+  DefaultLoggerOverride default_logger_override_;
 };
 
 // Convenience: Qualcomm vendor ID computed the same way as in the factory
@@ -1017,17 +1065,15 @@ TEST_F(QnnUnit_ProviderFactoryTest, ReleaseEpFactory_NullPointer_ReturnsNull) {
 // construction failures are tolerated with a diagnostic).
 // ===========================================================================
 
-class QnnUnit_ProviderFactoryHtpTest : public ::testing::Test {
+class QnnUnit_ProviderFactoryHtpTest : public QnnUnit_ProviderFactoryTest {
  protected:
   void SetUp() override {
-    OrtLoggingManager::SetDefaultLogger(nullptr);
+    QnnUnit_ProviderFactoryTest::SetUp();
     QnnRealHtpBackendContext htp_check;
     if (!htp_check.IsValid()) {
       GTEST_SKIP() << QnnHtpBackendLibraryName() << " not available";
     }
   }
-
-  void TearDown() override { OrtLoggingManager::SetDefaultLogger(nullptr); }
 };
 
 // Verifies that CreateEpImpl enters the autoep branch when neither
@@ -1137,7 +1183,7 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
 
   // ValidateCompiledModelCompatibilityInfoImpl requires HasDefaultLogger().
   auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  OrtLoggingManager::SetDefaultLogger(fake_logger);
+  SetDefaultLoggerForTest(fake_logger);
 
   OrtHardwareDevice* npu = MakeFakeHwDevice(23);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
@@ -1172,7 +1218,7 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
   QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
 
   auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  OrtLoggingManager::SetDefaultLogger(fake_logger);
+  SetDefaultLoggerForTest(fake_logger);
 
   OrtHardwareDevice* npu = MakeFakeHwDevice(24);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;

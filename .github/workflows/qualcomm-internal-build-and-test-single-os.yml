@@ -45,10 +45,6 @@ on:
         description: "Enable QNN EP internal unit-test symbols for supported targets."
         default: false
         type: boolean
-      ci_job_suffix:
-        description: "Suffix appended to build, test-report, and artifact names to distinguish parallel validation jobs."
-        default: ""
-        type: string
       version_suffix:
         description: "Version suffix. If set, the specified suffix will be appended to the version string."
         type: string
@@ -133,8 +129,8 @@ env:
   # Cross compilation on Windows adds a folder to the build directory.
   BUILD_CONFIG_DIR: "${{ (inputs.target_os == 'windows' && ((inputs.build_runner_arch == 'X64' && inputs.target_arch != 'x86_64') || (inputs.build_runner_arch == 'ARM64' && inputs.target_arch != 'arm64'))) && format('{0}/{0}', inputs.build_config) || inputs.build_config }}"
 
-  # The internal-symbol build is intentionally isolated from the shipping x86_64 build directory.
-  BUILD_DIR_ARCH: "${{ inputs.target_os == 'windows' && inputs.target_arch == 'x86_64' && inputs.qnn_internal_ut_symbols && format('{0}-internal-symbols', inputs.target_arch) || inputs.target_arch }}"
+  # The internal-symbol build is intentionally isolated from the shipping Windows build directory.
+  BUILD_DIR_ARCH: "${{ inputs.target_os == 'windows' && inputs.qnn_internal_ut_symbols && format('{0}-internal-symbols', inputs.target_arch) || inputs.target_arch }}"
 
   TEST_ARCHIVE_EXT: "${{ inputs.target_os == 'linux' && 'tar.bz2' || 'zip' }}"
 
@@ -151,7 +147,7 @@ env:
 
 jobs:
   build:
-    name: "build-${{inputs.target_os}}-${{inputs.target_arch}}${{ inputs.ci_job_suffix }}-py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}}"
+    name: "build-${{inputs.target_os}}-${{inputs.target_arch}}${{ inputs.qnn_internal_ut_symbols && '-internal-symbols' || '' }}-py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}}"
     runs-on: ["self-hosted", "${{ inputs.build_runner_os != '' && inputs.build_runner_os || inputs.target_os }}", "${{ inputs.build_runner_arch }}", "Build"]
     defaults:
       run:
@@ -190,7 +186,7 @@ jobs:
         # Skipped on fork PRs: the action creates a check run, which the fork-PR GITHUB_TOKEN cannot do.
         if: ${{ always() && inputs.has_code_changes && inputs.run_tests && inputs.build_test_same_runner && github.event.pull_request.head.repo.fork != true }}
         with:
-          check_name: ${{inputs.target_os}}-${{inputs.target_arch}}${{ inputs.ci_job_suffix }}-py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}}-test-results
+          check_name: ${{inputs.target_os}}-${{inputs.target_arch}}${{ inputs.qnn_internal_ut_symbols && '-internal-symbols' || '' }}-py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}}-test-results
           group_reports: false
           include_passed: true
           detailed_summary: true
@@ -202,7 +198,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{ always() && inputs.has_code_changes && inputs.run_tests && inputs.build_test_same_runner }} # always run even if the previous step fails
         with:
-          name: ORT ${{inputs.target_os}} ${{inputs.target_arch}}${{ inputs.ci_job_suffix }} py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}} Test Results
+          name: ORT ${{inputs.target_os}} ${{inputs.target_arch}}${{ inputs.qnn_internal_ut_symbols && '-internal-symbols' || '' }} py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}} Test Results
           retention-days: 7
           path: |
             ${{ github.workspace }}/build/${{inputs.target_os}}-${{env.BUILD_DIR_ARCH}}/${{ env.BUILD_CONFIG_DIR }}/*.results.xml

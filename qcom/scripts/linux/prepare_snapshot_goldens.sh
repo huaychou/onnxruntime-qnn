@@ -2,7 +2,8 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: MIT
 #
-# Download and enable the latest QNN snapshot-golden store for a coverage run.
+# Download and enable the latest QNN snapshot-golden store for a QNN EP
+# internal-symbol test run.
 # A missing, corrupt, or version-mismatched store deliberately leaves
 # QNN_UT_SNAPSHOT_GOLDEN_DIR unset, so accuracy_gate.py runs full accuracy.
 
@@ -110,7 +111,7 @@ if actual_qairt != expected_qairt or actual_ort != expected_ort:
     raise SystemExit(1)
 PY
 then
-    disable_store "manifest is absent or versions do not match the coverage build."
+    disable_store "manifest is absent or versions do not match the QNN EP test build."
 fi
 
 extract_dir="${staging}/extracted"

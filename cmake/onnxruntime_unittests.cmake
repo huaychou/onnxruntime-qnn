@@ -406,9 +406,8 @@ block()
     # Coverage builds and explicit internal-symbol builds enable this gate.
     target_compile_definitions(onnxruntime_provider_test PRIVATE QNN_EP_INTERNAL_SYMBOL_ACCESS=1)
     # Accuracy tier: gates the per-op accuracy test files (e.g.
-    # accuracy/builder/opbuilder/clip_test.cc). Shares the
-    # INTERNAL_SYMBOL_ACCESS prereqs (Linux x86_64 + shared QNN EP), so it
-    # is enabled together with coverage rather than as a separate opt-in.
+    # accuracy/builder/opbuilder/clip_test.cc). It shares the same
+    # internal-symbol prerequisites as the component and snapshot tiers.
     target_compile_definitions(onnxruntime_provider_test PRIVATE QNN_EP_ACCURACY_UT=1)
   endif()
 

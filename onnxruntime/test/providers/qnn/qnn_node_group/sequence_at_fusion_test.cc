@@ -48,7 +48,7 @@ static GetTestModelFn BuildSequenceAtTestCase(
       builder.MakeScalarInitializer<PosType>(pos_name, static_pos_value);
     }
 
-    builder.MakeOutput("output");
+    builder.MakeOutput<float>("output", elem_shape);
     builder.AddNode("seq_at", "SequenceAt", {"sequence", pos_name}, {"output"});
   };
 }
@@ -71,7 +71,7 @@ static GetTestModelFn BuildSequenceAtFloat16TestCase(
 
     builder.AddNode("seq_construct", "SequenceConstruct", elem_names, {"sequence"});
     builder.MakeScalarInitializer<int64_t>("position", static_pos_value);
-    builder.MakeOutput("output");
+    builder.MakeOutput<Ort::Float16_t>("output", elem_shape);
     builder.AddNode("seq_at", "SequenceAt", {"sequence", "position"}, {"output"});
   };
 }
@@ -288,7 +288,7 @@ TEST_F(QnnCPUBackendTests, SequenceAtFusion_CpuFallback_HeterogeneousShapes) {
 
     builder.AddNode("seq_construct", "SequenceConstruct", {"elem_0", "elem_1"}, {"sequence"});
     builder.MakeScalarInitializer<int64_t>("position", 0LL);
-    builder.MakeOutput("output");
+    builder.MakeOutput<float>("output", std::vector<int64_t>{2, 3});
     builder.AddNode("seq_at", "SequenceAt", {"sequence", "position"}, {"output"});
   };
 

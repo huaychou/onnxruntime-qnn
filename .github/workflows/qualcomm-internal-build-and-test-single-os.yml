@@ -42,7 +42,7 @@ on:
         default: "Release"
         type: string
       qnn_internal_ut_symbols:
-        description: "Build and test Windows x86_64 with QNN EP internal unit-test symbols exported."
+        description: "Enable QNN EP internal unit-test symbols for supported targets."
         default: false
         type: boolean
       ci_job_suffix:

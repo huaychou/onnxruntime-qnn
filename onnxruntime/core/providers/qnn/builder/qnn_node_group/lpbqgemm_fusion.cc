@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "core/providers/qnn/builder/op_builder_factory.h"
+#include "core/providers/qnn/builder/qnn_bq_utils.h"
 #include "core/providers/qnn/builder/qnn_model_wrapper.h"
 #include "core/providers/qnn/builder/qnn_node_group/utils.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
@@ -131,16 +132,17 @@ std::unique_ptr<IQnnNodeGroup> LowPowerBlockQuantizedGemmFusion::TryFusion(
     return nullptr;
   }
 
-  if (!CreateOrValidateOnQnn(qnn_model_wrapper,
-                             *p_scale_dql_node_unit,
-                             p_w_ql_node_unit,
-                             *p_w_dql_node_unit,
-                             *p_act_dql_node_unit,
-                             gemm_node_unit,
-                             *p_output_ql_node_unit,
-                             logger,
-                             true)
-           .IsOK()) {
+  if (Ort::Status status = CreateOrValidateOnQnn(qnn_model_wrapper,
+                                                 *p_scale_dql_node_unit,
+                                                 p_w_ql_node_unit,
+                                                 *p_w_dql_node_unit,
+                                                 *p_act_dql_node_unit,
+                                                 gemm_node_unit,
+                                                 *p_output_ql_node_unit,
+                                                 logger,
+                                                 true);
+      !status.IsOK()) {
+    ORT_CXX_LOG(logger, ORT_LOGGING_LEVEL_VERBOSE, ("Fusion failed: " + status.GetErrorMessage()).c_str());
     return nullptr;
   }
 
@@ -252,6 +254,8 @@ Ort::Status CreateOrValidateOnQnn(QnnModelWrapper& qnn_model_wrapper,
   const OrtNodeUnitIODef& per_block_int_def = scale_dql_node_unit.Inputs()[0];
   const OrtValueInfo* per_block_int_scale_info = qnn_model_wrapper.GetConstantTensor(per_block_int_def.name);
   RETURN_IF_ERROR(qnn_model_wrapper.UnpackScales<uint8_t>(per_block_int_scale_info, per_block_int_scale));
+  RETURN_IF_NOT(bq::IsValidLPBQPerBlockIntScale(gsl::span<const uint8_t>(per_block_int_scale)),
+                "Per-block int scale is out of expected 4bit range.");
   std::vector<int32_t> weight_offset(per_channel_float_scale.size(), 0);
   std::vector<uint32_t> block_scales_shape;
   RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(

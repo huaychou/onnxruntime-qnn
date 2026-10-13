@@ -25,8 +25,8 @@ namespace test {
 
 namespace {
 
-GetQDQTestCaseFn BuildLPBQMatMulTestCase() {
-  return [](ModelTestBuilder& builder) -> void {
+GetQDQTestCaseFn BuildLPBQMatMulTestCase(uint8_t scale_min = 1, uint8_t scale_max = 16) {
+  return [scale_min, scale_max](ModelTestBuilder& builder) -> void {
     // Define the test case for LPBQGemm fusion here
     const int64_t input_channels = 16;
     const int64_t output_channels = 16;
@@ -48,8 +48,7 @@ GetQDQTestCaseFn BuildLPBQMatMulTestCase() {
                     {"act_ql_output", "act_dql_scale", "act_dql_zero_point"}, {"act_dql_output"});
 
     // DequantizeLinear for Scale
-    builder.MakeInitializer<uint8_t>("scale_dql_input", {blocks_per_axis, output_channels},
-                                     static_cast<uint8_t>(1), static_cast<uint8_t>(16));
+    builder.MakeInitializer<uint8_t>("scale_dql_input", {blocks_per_axis, output_channels}, scale_min, scale_max);
     builder.MakeInitializer<float>("scale_dql_scale", {output_channels}, 0.01f, 0.02f);
     std::vector<uint8_t> dql_zero_points_data = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     builder.Make1DInitializer<uint8_t>("scale_dql_zero_point", dql_zero_points_data);
@@ -112,12 +111,7 @@ ProviderOptions GetProviderOptions() {
 
 }  // namespace
 
-#if defined(_WIN32)
-// Graph fails to compose on ARM64 Windows since QNN 2.37.0
-TEST_F(QnnHTPBackendTests, DISABLED_LPBQMatMulFusion) {
-#else
 TEST_F(QnnHTPBackendTests, LPBQMatMulFusion) {
-#endif
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
   const std::filesystem::path json_qnn_graph_dir = "LPBQMatMulFusion";
   std::filesystem::remove_all(json_qnn_graph_dir);
@@ -135,6 +129,30 @@ TEST_F(QnnHTPBackendTests, LPBQMatMulFusion) {
                   /*verify_outputs=*/false);
 
   AssertOpInQnnGraph(json_qnn_graph_dir, "MatMul");
+}
+
+TEST_F(QnnHTPBackendTests, LPBQMatMulFusion_OutOfRangeScaleMin) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+
+  ProviderOptions provider_options = GetProviderOptions();
+  RunQnnModelTest(BuildLPBQMatMulTestCase(/*scale_min=*/0),
+                  provider_options,
+                  /*opset_version=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::None, ElementwiseAbsoluteVerifier(1e-2f)},
+                  /*log_severity =*/OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                  /*verify_outputs=*/false);
+}
+
+TEST_F(QnnHTPBackendTests, LPBQMatMulFusion_OutOfRangeScaleMax) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+
+  ProviderOptions provider_options = GetProviderOptions();
+  RunQnnModelTest(BuildLPBQMatMulTestCase(/*scale_min=*/1, /*scale_max=*/17),
+                  provider_options,
+                  /*opset_version=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::None, ElementwiseAbsoluteVerifier(1e-2f)},
+                  /*log_severity =*/OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                  /*verify_outputs=*/false);
 }
 
 #endif  // defined(__aarch64__) || defined(_M_ARM64)

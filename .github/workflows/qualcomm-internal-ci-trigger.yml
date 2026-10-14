@@ -204,9 +204,45 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       # This handler runs from the default branch and never checks out PR code.
-      - uses: actions/github-script@v8
+      - name: Report approved CI result
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const branch = run.head_branch;
+            const match = /^ci\/approve-ci\/(\d+)\/([0-9a-f]{40})\/\d+-\d+$/.exec(branch);
+            if (!match || match[2] !== run.head_sha ||
+                run.head_repository?.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
+                run.path !== '.github/workflows/qualcomm-internal-ci.yml') {
+              core.info('Not a matching temporary approved-CI branch; no result to report.');
+              return;
+            }
+
+            const prNumber = Number(match[1]);
+            const approvedSha = match[2];
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: prNumber,
+            });
+            const currentHeadNote = pr.head.sha === approvedSha
+              ? ''
+              : `\n\n⚠️ This result is for an older commit. The current PR head is \`${pr.head.sha}\`.`;
+            const result = run.conclusion === 'success'
+              ? '✅ Maintainer-approved full CI passed'
+              : `❌ Maintainer-approved full CI completed with conclusion \`${run.conclusion}\``;
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: prNumber,
+              body: `${result} for \`${approvedSha}\`. [View workflow run](${run.html_url}).${currentHeadNote}`,
+            });
+
+      - name: Delete approved CI branch
+        if: ${{ always() }}
+        uses: actions/github-script@v8
         with:
           script: |
             const run = context.payload.workflow_run;

@@ -133,6 +133,36 @@ static bool InputReshapeIsShared(const OrtNodeUnit* input_reshape) {
   return !reshape_outputs.empty() && reshape_outputs[0].GetConsumers().size() > 1;
 }
 
+// Targeted HTP performance workaround: this pattern changes the output
+// Reshape that TryFusion4 preserves. Use the conservative 3-node path instead.
+static bool HasKnownSlowFourNodeReshapePattern(const QnnModelWrapper& qnn_model_wrapper,
+                                               const OrtNodeUnit& reshape_node_unit) {
+  OrtNodeAttrHelper attr_helper(reshape_node_unit);
+  if (attr_helper.Get("allowzero", static_cast<int64_t>(0)) == 0) {
+    return false;
+  }
+
+  const auto& inputs = reshape_node_unit.Inputs();
+  if (inputs.size() < 2) {
+    return false;
+  }
+
+  const OrtValueInfo* shape_tensor = nullptr;
+  if (!qnn_model_wrapper.FindInitializer(inputs[1].name, &shape_tensor).IsOK()) {
+    return false;
+  }
+
+  std::vector<uint8_t> unpacked_tensor;
+  if (!qnn_model_wrapper.UnpackInitializerData(shape_tensor, unpacked_tensor).IsOK() ||
+      unpacked_tensor.size() % sizeof(int64_t) != 0) {
+    return false;
+  }
+
+  const auto* shape_data = reinterpret_cast<const int64_t*>(unpacked_tensor.data());
+  const size_t shape_size = unpacked_tensor.size() / sizeof(int64_t);
+  return ReshapeGemmFusionGroup::IsZeroFreeReshapeShape(gsl::make_span(shape_data, shape_size));
+}
+
 // Get the input Reshape (or Flatten) node unit that feeds into the Gemm node.
 // A leading Flatten is equivalent to an explicit Reshape here (both yield 2D for Gemm);
 // frontends emit Flatten when flattened dims may be dynamic.
@@ -538,6 +568,11 @@ std::unique_ptr<IQnnNodeGroup> ReshapeGemmFusionGroup::TryFusion4(
   const OrtNodeUnit* output_reshape2 = GetOutputReshape2NodeUnit(
       qnn_model_wrapper, *output_reshape1, node_to_node_unit, node_unit_to_qnn_node_group);
   if (!output_reshape2) {
+    return nullptr;
+  }
+
+  // TryFusion3 still fuses the FC prefix while retaining both output Reshapes.
+  if (HasKnownSlowFourNodeReshapePattern(qnn_model_wrapper, *output_reshape2)) {
     return nullptr;
   }
 

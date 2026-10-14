@@ -10,6 +10,7 @@
 #include <gsl/util>
 #include "gtest/gtest.h"
 
+#include "core/providers/qnn/builder/qnn_node_group/reshape_gemm_fusion.h"
 #include "test/providers/qnn/qnn_node_group/qnn_graph_checker.h"
 #include "test/providers/qnn/qnn_test_utils.h"
 
@@ -19,6 +20,13 @@ namespace test {
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
 
 namespace {
+
+TEST(QnnUnit_ReshapeGemmFusion, ZeroFreeReshapeShape) {
+  const std::vector<int64_t> zero_free_shape{1, 128, 1024};
+  const std::vector<int64_t> zero_dim_shape{1, 0, 1024};
+  EXPECT_TRUE(qnn::ReshapeGemmFusionGroup::IsZeroFreeReshapeShape(zero_free_shape));
+  EXPECT_FALSE(qnn::ReshapeGemmFusionGroup::IsZeroFreeReshapeShape(zero_dim_shape));
+}
 
 // Build a 2-node fusion test case: Reshape -> Gemm
 // Input: [batch, seq, hidden] -> Reshape to [batch*seq, hidden] -> Gemm -> [batch*seq, out]
@@ -104,8 +112,9 @@ GetTestModelFn BuildReshapeGemmReshapeTestCase(const std::vector<int64_t>& input
 // Input: [batch, seq, hidden] -> Reshape -> Gemm -> Reshape -> Reshape -> [1, batch*seq, out]
 GetTestModelFn BuildReshapeGemmReshapeReshapeTestCase(const std::vector<int64_t>& input_shape,
                                                       int64_t hidden_size,
-                                                      int64_t output_size) {
-  return [input_shape, hidden_size, output_size](ModelTestBuilder& builder) -> void {
+                                                      int64_t output_size,
+                                                      bool reshape3_allowzero = false) {
+  return [input_shape, hidden_size, output_size, reshape3_allowzero](ModelTestBuilder& builder) -> void {
     builder.graph_->set_name("reshape_gemm_reshape_reshape_graph");
 
     // Input tensor
@@ -142,7 +151,12 @@ GetTestModelFn BuildReshapeGemmReshapeReshapeTestCase(const std::vector<int64_t>
 
     // Reshape3: [batch, seq, output] -> [1, batch*seq, output]
     builder.Make1DInitializer<int64_t>("reshape3_shape", {1, batch_size, output_size});
-    builder.AddNode("reshape3", "Reshape", {"reshape2_out", "reshape3_shape"}, {"output"}, kOnnxDomain);
+    std::vector<ONNX_NAMESPACE::AttributeProto> reshape3_attrs;
+    if (reshape3_allowzero) {
+      reshape3_attrs.emplace_back(test::MakeAttribute("allowzero", static_cast<int64_t>(1)));
+    }
+    builder.AddNode("reshape3", "Reshape", {"reshape2_out", "reshape3_shape"}, {"output"}, kOnnxDomain,
+                    reshape3_attrs);
 
     builder.MakeOutput("output");
   };
@@ -306,6 +320,30 @@ TEST_F(QnnHTPBackendTests, ReshapeGemmReshapeReshapeFusion_3D) {
   // Verify FullyConnected and one Reshape (only final reshape kept)
   AssertOpInQnnGraph(json_qnn_graph_dir, "FullyConnected", 1);
   AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 1);
+}
+
+// A zero-free allowzero=1 target selects the conservative fusion path.
+TEST_F(QnnHTPBackendTests, ReshapeGemmReshapeReshapeFusion_AllowZeroNoZeros_ConservativePath) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  const std::filesystem::path json_qnn_graph_dir = "ReshapeGemmReshapeReshapeFusion_AllowZeroNoZeros";
+  std::filesystem::remove_all(json_qnn_graph_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(json_qnn_graph_dir));
+  auto cleanup = gsl::finally([&json_qnn_graph_dir]() { std::filesystem::remove_all(json_qnn_graph_dir); });
+
+  ProviderOptions provider_options = GetProviderOptions();
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = json_qnn_graph_dir.string();
+
+  RunQnnModelTest(BuildReshapeGemmReshapeReshapeTestCase({1, 32, 64}, 64, 128,
+                                                         /*reshape3_allowzero=*/true),
+                  provider_options,
+                  /*opset_version=*/14,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+
+  // TryFusion4 must be skipped. TryFusion3 still supplies FC for the prefix,
+  // leaving both output Reshapes on the conservative path.
+  AssertOpInQnnGraph(json_qnn_graph_dir, "FullyConnected", 1);
+  AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 2);
 }
 
 // Test 3-node fusion with ViT-like pattern: keep first dim, flatten last dims

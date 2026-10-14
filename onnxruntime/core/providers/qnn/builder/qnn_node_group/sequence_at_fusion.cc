@@ -7,6 +7,7 @@
 #include <gsl/gsl>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -35,17 +36,31 @@ static Ort::Status CreateOrValidateOnQnn(QnnModelWrapper& qmw,
                                          bool validate);
 
 // ---------------------------------------------------------------------------
-// Helper: check whether an ONNX element data type is representable in QNN
+// Helper: check whether an ONNX element data type is within the documented
+// backend matrix for this fusion.
+//
+// Allowlist (union of HTP and GPU Gather/Reshape/Concat tables):
+//   float32, float16, int8, uint8, int16, uint16, int32, int64, bool
+//
+// Excluded types fall back to CPU EP.  Using an allowlist (rather than a
+// denylist of string/complex) means that newly-added ONNX types (e.g. float8,
+// double, uint32, uint64) are safe-by-default-rejected until explicitly added.
 // ---------------------------------------------------------------------------
 
 static bool IsElementTypeSupported(ONNXTensorElementDataType etype) {
   switch (etype) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128:
-      return false;
-    default:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:    // float32  — HTP + GPU
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:  // float16  — HTP + GPU
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:     //           HTP only
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:    //           HTP only
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:    //           HTP only
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:   //           HTP only
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:    //           HTP + GPU
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:    //           HTP + GPU
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:     //           HTP only
       return true;
+    default:
+      return false;
   }
 }
 
@@ -73,25 +88,51 @@ std::unique_ptr<IQnnNodeGroup> SequenceAtFusion::TryFusion(
   // only enumerates consumers of tensor-typed edges. The sequence output of
   // SequenceConstruct is seq(tensor(T)), so GetConsumers() silently returns an empty
   // list. Instead, get the sequence output name from the raw Node API and scan
-  // node_to_node_unit for a SequenceAt node whose first (sequence-typed) input matches.
+  // node_to_node_unit for every node whose first raw input matches the sequence output.
+  //
+  // We require:
+  //   (a) The sequence output is NOT a graph output — if it were, the graph or another
+  //       EP segment is observing it as a sequence value that we would silently drop.
+  //   (b) Exactly ONE consumer of the sequence output exists across the entire graph.
+  //       Other sequence ops (SequenceLength, ConcatFromSequence, SequenceInsert, etc.)
+  //       also take seq(tensor(T)) as input; if any of them co-consume the output, fusing
+  //       SequenceConstruct away would leave them with a dangling edge QNN cannot produce.
+  //   (c) That single consumer has op type "SequenceAt" and is a SingleNode unit.
   const Ort::ConstNode sc_node(&seq_construct_unit.GetNode());
   const auto sc_outputs = sc_node.GetOutputs();
   if (sc_outputs.size() != 1) {
     return nullptr;
   }
-  const std::string seq_output_name = sc_outputs[0].GetName();
+  const Ort::ConstValue seq_output_value = sc_outputs[0];
+  const std::string seq_output_name = seq_output_value.GetName();
 
+  // (a) Reject if the sequence tensor is itself a graph output.
+  if (qnn_model_wrapper.IsGraphOutput(seq_output_name)) {
+    return nullptr;
+  }
+
+  // (b)+(c) Count ALL consumers of seq_output_name; require exactly one, which must be SequenceAt.
   const OrtNodeUnit* seq_at_unit_ptr = nullptr;
   for (const auto& [node_ptr, unit_ptr] : node_to_node_unit) {
-    if (unit_ptr == nullptr || unit_ptr->OpType() != "SequenceAt") continue;
+    if (unit_ptr == nullptr) continue;
     if (unit_ptr->UnitType() != OrtNodeUnit::Type::SingleNode) continue;
-    // Use the raw Node API: seq_at.Inputs()[0] has name="" because ParseOrtValueInfo
-    // fails for sequence types. GetInputs() on the underlying OrtNode returns the real names.
-    const Ort::ConstNode sa_node(node_ptr);
-    const auto sa_raw_inputs = sa_node.GetInputs();
-    if (sa_raw_inputs.empty() || sa_raw_inputs[0].GetName() != seq_output_name) continue;
-    if (seq_at_unit_ptr != nullptr) {
-      return nullptr;  // multiple SequenceAt consumers — cannot fuse
+    // Use the raw Node API: the sequence-typed input has name="" in the OrtNodeUnit layer
+    // because ParseOrtValueInfo fails for seq(tensor(T)). GetInputs() on the underlying
+    // OrtNode returns the real edge names.
+    const Ort::ConstNode candidate_node(node_ptr);
+    const auto candidate_inputs = candidate_node.GetInputs();
+    bool consumes_sequence = false;
+    for (const auto& inp : candidate_inputs) {
+      if (inp.GetName() == seq_output_name) {
+        consumes_sequence = true;
+        break;
+      }
+    }
+    if (!consumes_sequence) continue;
+
+    // This node consumes the sequence output — it must be the one and only SequenceAt.
+    if (unit_ptr->OpType() != "SequenceAt" || seq_at_unit_ptr != nullptr) {
+      return nullptr;  // non-SequenceAt consumer, or more than one total consumer
     }
     seq_at_unit_ptr = unit_ptr;
   }
@@ -146,13 +187,56 @@ std::unique_ptr<IQnnNodeGroup> SequenceAtFusion::TryFusion(
       pos_input.type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
     return nullptr;
   }
-  // Position must be scalar (rank-0 tensor).
-  // Check the raw ONNX shape directly: a rank-0 scalar has an empty shape vector {}.
+  // Position must be a scalar (rank-0 tensor): shape must be statically known and empty.
+  // Reject nullopt — an unknown shape would cause GetTensorInfo → GetOnnxShape to fail
+  // inside CreateOrValidateOnQnn, producing a hard AddToModelBuilder error instead of a
+  // graceful CPU fallback.  Reject non-empty shape — a non-scalar position is invalid
+  // per ONNX spec.
   // Do NOT use GetOnnxShape here — it converts {} to {1} for QNN, which would
   // incorrectly flag a valid scalar as a non-scalar 1D tensor.
-  // If shape is unknown (nullopt), accept it and let QNN validation catch errors.
-  if (pos_input.shape.has_value() && !pos_input.shape->empty()) {
+  if (!pos_input.shape.has_value() || !pos_input.shape->empty()) {
     return nullptr;
+  }
+
+  // If the position is a static initializer, validate its value now so that an
+  // out-of-range pos causes TryFusion to return nullptr (graceful CPU fallback)
+  // rather than having AddToModelBuilder fail with a hard error at session creation.
+  // All range checks are performed in int64 before any narrowing to int32, so that
+  // values like 2^32+1 (which would silently truncate to 1 after static_cast<int32_t>)
+  // are correctly rejected.
+  {
+    TensorInfo pos_info_check{};
+    if (qnn_model_wrapper.GetTensorInfo(pos_input, pos_info_check).IsOK() &&
+        pos_info_check.is_initializer) {
+      std::vector<uint8_t> raw_bytes;
+      if (!qnn_model_wrapper.UnpackInitializerData(pos_info_check.initializer_tensor,
+                                                   raw_bytes)
+               .IsOK()) {
+        return nullptr;
+      }
+
+      int64_t pos_val64 = 0;
+      if (pos_input.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+        if (raw_bytes.size() < sizeof(int64_t)) return nullptr;  // short / corrupt initializer
+        std::memcpy(&pos_val64, raw_bytes.data(), sizeof(int64_t));
+      } else {  // int32
+        if (raw_bytes.size() < sizeof(int32_t)) return nullptr;
+        int32_t val32 = 0;
+        std::memcpy(&val32, raw_bytes.data(), sizeof(int32_t));
+        pos_val64 = static_cast<int64_t>(val32);
+      }
+
+      // Valid range (before normalization): [-N, N-1].
+      // Also guard against values that exceed INT32_MAX — after normalization
+      // pos += N the result must still fit in int32 (N itself is a small count
+      // of graph inputs, always well within INT32_MAX, so this only catches
+      // wildly out-of-range int64 literals).
+      const int64_t n64 = static_cast<int64_t>(N);
+      if (pos_val64 < -n64 || pos_val64 >= n64 ||
+          pos_val64 > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return nullptr;
+      }
+    }
   }
 
   // Step 6: QNN op validation (CreateOrValidateOnQnn in validate=true mode).
@@ -344,19 +428,32 @@ static Ort::Status CreateOrValidateOnQnn(QnnModelWrapper& qmw,
     auto unpack_s = qmw.UnpackInitializerData(pos_info.initializer_tensor, raw_bytes);
     if (!unpack_s.IsOK()) return std::move(unpack_s);
 
-    int32_t pos_val = 0;
+    // Perform range and truncation checks in int64 before narrowing to int32.
+    // TryFusion already validated this path; these checks are a defensive last line.
+    int64_t pos_val64 = 0;
     if (pos_info.qnn_data_type == QNN_DATATYPE_INT_64) {
-      int64_t val64 = 0;
-      if (raw_bytes.size() >= sizeof(int64_t)) std::memcpy(&val64, raw_bytes.data(), sizeof(int64_t));
-      pos_val = static_cast<int32_t>(val64);
+      if (raw_bytes.size() < sizeof(int64_t)) {
+        return MAKE_EP_FAIL("SequenceAtFusion: int64 position initializer has fewer bytes than expected.");
+      }
+      std::memcpy(&pos_val64, raw_bytes.data(), sizeof(int64_t));
     } else {
-      if (raw_bytes.size() >= sizeof(int32_t)) std::memcpy(&pos_val, raw_bytes.data(), sizeof(int32_t));
+      if (raw_bytes.size() < sizeof(int32_t)) {
+        return MAKE_EP_FAIL("SequenceAtFusion: int32 position initializer has fewer bytes than expected.");
+      }
+      int32_t val32 = 0;
+      std::memcpy(&val32, raw_bytes.data(), sizeof(int32_t));
+      pos_val64 = static_cast<int64_t>(val32);
     }
 
-    if (pos_val < 0) pos_val += static_cast<int32_t>(N);
-    if (!(pos_val >= 0 && static_cast<size_t>(pos_val) < N)) {
+    const int64_t n64 = static_cast<int64_t>(N);
+    if (pos_val64 < -n64 || pos_val64 >= n64 ||
+        pos_val64 > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
       return MAKE_EP_FAIL("SequenceAtFusion: static position is out of range.");
     }
+
+    // Normalize: convert negative index to its positive equivalent.
+    int32_t pos_val = static_cast<int32_t>(pos_val64);
+    if (pos_val < 0) pos_val += static_cast<int32_t>(N);
 
     pos32_name = base + "_pos_normalized";
     auto add_s = AddInt32Const(pos32_name, pos_val);

@@ -1013,7 +1013,7 @@ TEST_F(QnnCPUBackendTests, MatMulf32_PerChannelQDQChain_QwenQProj_MustFold) {
   AssertFp32StaticBytesAbove(graph_dir, /*min_bytes*/ 1024 * 1024);
 }
 
-// Tests for the `use_native_matmul` session config option (AISW-202299).
+// Tests for the `use_native_matmul` session config option.
 // When set to "1", the QNN EP routes rank-2 static-weight MatMul to QNN_OP_MAT_MUL instead
 // of QNN_OP_FULLY_CONNECTED. The tests use the JSON graph dump to assert the exact op type
 // present in the compiled QNN graph.

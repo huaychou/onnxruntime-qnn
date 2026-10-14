@@ -27,6 +27,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -214,9 +215,50 @@ TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_OwnsNodeNames) {
 
   node_names.clear();
 
-  ASSERT_EQ(callback_info.ep_node_names.size(), 2u);
-  EXPECT_EQ(callback_info.ep_node_names[0], "node_0");
-  EXPECT_EQ(callback_info.ep_node_names[1], "node_1");
+  ASSERT_EQ(callback_info.GetEpNodeNames().size(), 2u);
+  EXPECT_EQ(callback_info.GetEpNodeNames()[0], "node_0");
+  EXPECT_EQ(callback_info.GetEpNodeNames()[1], "node_1");
+}
+
+TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_OutlivesManager) {
+  StubApiEnv env;
+  auto manager = MakeManager(QnnHtpBackendLibraryName(), env.api_ptrs, env.logger);
+  ASSERT_NE(manager, nullptr);
+  auto* callback_info = qnn::ContextCreateAsyncCallbackInfo::Create(manager, {"node_0"});
+
+  manager.reset();
+
+  ASSERT_NE(callback_info, nullptr);
+  EXPECT_EQ(callback_info->LockBackendManager(), nullptr);
+  ASSERT_EQ(callback_info->GetEpNodeNames().size(), 1u);
+  EXPECT_EQ(callback_info->GetEpNodeNames()[0], "node_0");
+}
+
+TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_DeactivateClosesAdmission) {
+  qnn::ContextCreateAsyncCallbackInfo callback_info(nullptr, {"node_0"});
+
+  callback_info.Deactivate();
+
+  EXPECT_FALSE(callback_info.TryAcquire());
+}
+
+TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_WaitsForAdmittedCallback) {
+  qnn::ContextCreateAsyncCallbackInfo callback_info(nullptr, {"node_0"});
+  ASSERT_TRUE(callback_info.TryAcquire());
+
+  std::promise<void> drain_started;
+  auto drain_started_future = drain_started.get_future();
+  auto drain_future = std::async(std::launch::async, [&callback_info, &drain_started]() {
+    callback_info.Deactivate();
+    drain_started.set_value();
+    callback_info.WaitForCallbacks();
+  });
+
+  drain_started_future.wait();
+  EXPECT_EQ(drain_future.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+
+  callback_info.Release();
+  EXPECT_EQ(drain_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
 }
 
 // ---------------------------------------------------------------------------

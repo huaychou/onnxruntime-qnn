@@ -12,6 +12,8 @@
 #include <dlfcn.h>
 #endif
 
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -63,17 +65,36 @@ class QnnBackendManager;
 // QNN retains this notifyParam for contextCreateFromBinaryListAsync callbacks. Keep the
 // initiating manager identity and node names independent of mutable process-wide shared state
 // and of the caller's context-bin map.
-struct ContextCreateAsyncCallbackInfo {
+class ContextCreateAsyncCallbackInfo {
+ public:
   ContextCreateAsyncCallbackInfo(const std::shared_ptr<QnnBackendManager>& manager,
                                  const std::vector<std::string>& node_names)
-      : backend_manager(manager), ep_node_names(node_names) {}
+      : backend_manager_(manager), ep_node_names_(node_names) {}
+
+  static ContextCreateAsyncCallbackInfo* Create(
+      const std::shared_ptr<QnnBackendManager>& manager,
+      const std::vector<std::string>& node_names);
+
+  bool TryAcquire();
+  void Release();
+  void Deactivate();
+  void WaitForCallbacks();
 
   std::shared_ptr<QnnBackendManager> LockBackendManager() const {
-    return backend_manager.lock();
+    return backend_manager_.lock();
   }
 
-  const std::weak_ptr<QnnBackendManager> backend_manager;
-  const std::vector<std::string> ep_node_names;
+  const std::vector<std::string>& GetEpNodeNames() const {
+    return ep_node_names_;
+  }
+
+ private:
+  const std::weak_ptr<QnnBackendManager> backend_manager_;
+  const std::vector<std::string> ep_node_names_;
+  std::mutex mutex_;
+  std::condition_variable callbacks_drained_cv_;
+  size_t callbacks_in_flight_ = 0;
+  bool active_ = true;
 };
 
 class QnnSerializerConfig {
@@ -770,9 +791,9 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
   std::mutex ep_context_handle_map_mutex_;
   std::unordered_map<std::string, Qnn_ContextHandle_t> ep_context_handle_map_;
 
-  // QNN may invoke context-creation callbacks after contextCreateFromBinaryListAsync returns.
-  // Retain their notify parameters for the manager lifetime.
-  std::vector<std::unique_ptr<ContextCreateAsyncCallbackInfo>> context_create_async_callback_infos_;
+  // Non-owning pointers to process-lifetime callback tombstones. Teardown deactivates and drains
+  // them before releasing context state, preventing stale asynchronous callbacks from repopulating it.
+  std::vector<ContextCreateAsyncCallbackInfo*> context_create_async_callback_infos_;
 
   // Vector of Qnn_ContextHandle_t. The context handles are owned by context_map_.
   std::vector<Qnn_ContextHandle_t> contexts_;
@@ -797,6 +818,9 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
 
 #ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
   std::unique_ptr<FileMappingInterface> file_mapper_ = nullptr;
+  // QNN may retain callback descriptors after contextCreateFromBinaryListAsync returns.
+  // deque keeps descriptor addresses stable as new asynchronous requests are added.
+  std::deque<Qnn_ContextBinaryCallback_t> context_binary_callbacks_;
   // Notify params for file mapping must persist throughout lifetime of
   // QnnBackendManager for release of DMA data callback on destruction
   std::vector<std::unique_ptr<FileMappingCallbackInfo_t>> file_mapping_notify_params_;

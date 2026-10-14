@@ -36,6 +36,7 @@
 #include "core/providers/qnn/builder/qnn_backend_manager.h"
 #include "core/providers/qnn/builder/qnn_model.h"
 #include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/shared_context.h"
 
 #include "test/providers/qnn/infra/qnn_unit_test_utils.h"
 
@@ -186,6 +187,36 @@ TEST(QnnUnit_BackendManagerTest, GetContextBinaryBuffer_BeforeSetup_ReturnsError
   auto status = manager->GetContextBinaryBuffer(/*is_multi_soc_buffer=*/false, &context_buffer, written_size);
   EXPECT_FALSE(status.IsOK());
   EXPECT_EQ(context_buffer, nullptr);
+}
+
+TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_PreservesInitiatingManager) {
+  StubApiEnv env;
+  auto initiating_manager = MakeManager(QnnHtpBackendLibraryName(), env.api_ptrs, env.logger);
+  auto other_manager = MakeManager(QnnHtpBackendLibraryName(), env.api_ptrs, env.logger);
+  ASSERT_NE(initiating_manager, nullptr);
+  ASSERT_NE(other_manager, nullptr);
+
+  qnn::ContextCreateAsyncCallbackInfo callback_info(initiating_manager, {"node_0"});
+  SharedContext::GetInstance().SetSharedQnnBackendManager(other_manager);
+
+  EXPECT_EQ(callback_info.LockBackendManager(), initiating_manager);
+
+  SharedContext::GetInstance().ResetSharedQnnBackendManager();
+  EXPECT_EQ(callback_info.LockBackendManager(), initiating_manager);
+}
+
+TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_OwnsNodeNames) {
+  StubApiEnv env;
+  auto manager = MakeManager(QnnHtpBackendLibraryName(), env.api_ptrs, env.logger);
+  ASSERT_NE(manager, nullptr);
+  std::vector<std::string> node_names{"node_0", "node_1"};
+  qnn::ContextCreateAsyncCallbackInfo callback_info(manager, node_names);
+
+  node_names.clear();
+
+  ASSERT_EQ(callback_info.ep_node_names.size(), 2u);
+  EXPECT_EQ(callback_info.ep_node_names[0], "node_0");
+  EXPECT_EQ(callback_info.ep_node_names[1], "node_1");
 }
 
 // ---------------------------------------------------------------------------

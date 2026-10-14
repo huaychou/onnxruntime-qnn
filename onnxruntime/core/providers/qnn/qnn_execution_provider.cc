@@ -1554,15 +1554,24 @@ QnnEp::QnnEp(QnnEpFactory& factory,
                                                     false,
                                                     logger_);
 
-  // For context binary generation with weight sharing enabled, use the QnnBackendManager from the shared context if it exits
-  // So that all graphs from later sessions will be compiled into the same QNN context
+  // For context binary generation with weight sharing enabled, use the QnnBackendManager from the shared context if it exists
+  // so that all graphs from later sessions will be compiled into the same QNN context. Keep the result from a single lookup:
+  // another session may clear the singleton, but this session must retain the manager it adopted.
   const bool use_shared_backend_mgr =
       ((context_cache_enabled_ && share_ep_contexts_) || htp_share_resource_optimization_ == 1);
-  if (use_shared_backend_mgr && SharedContext::GetInstance().GetSharedQnnBackendManager()) {
-    qnn_backend_manager_ = SharedContext::GetInstance().GetSharedQnnBackendManager();
+  auto shared_qnn_backend_manager = use_shared_backend_mgr
+                                        ? SharedContext::GetInstance().GetSharedQnnBackendManager()
+                                        : nullptr;
+  if (shared_qnn_backend_manager) {
+    qnn_backend_manager_ = std::move(shared_qnn_backend_manager);
     // Reset QnnBackendManager's logger to the one in current session as original one could be deleted along with the
     // previous session.
     qnn_backend_manager_->ResetLogger(logger_);
+    // Clear the singleton when this session closes the sharing window. Async context callbacks
+    // retain the initiating manager identity and do not depend on this process-wide slot.
+    if (stop_share_ep_contexts_) {
+      SharedContext::GetInstance().ResetSharedQnnBackendManager();
+    }
   } else {
     qnn_backend_manager_ = qnn::QnnBackendManager::Create(
         qnn::QnnBackendManagerConfig{backend_path,
@@ -1582,16 +1591,11 @@ QnnEp::QnnEp(QnnEpFactory& factory,
                                      reused_io_limit_mb,
                                      enable_htp_cross_device_prepare},
         ApiPtrs{ort_api, ep_api, model_editor_api}, logger_);
-    // Publish for later sessions. Always publish when htp_share_resource_optimization_==1,
-    // even for a terminator session, because ContextCreateAsyncCallback retrieves the backend
-    // manager from the singleton during SetupBackend (GetCapability). The terminator reset for
-    // all sharing paths is deferred to after SetupBackend completes (in GetCapabilityImpl).
+    // Publish for later sessions when resource sharing is enabled.
     if (htp_share_resource_optimization_ == 1) {
       SharedContext::GetInstance().SetSharedQnnBackendManager(qnn_backend_manager_);
     }
   }
-  // Terminator reset is deferred to GetCapabilityImpl (after SetupBackend) for both
-  // htp_share_resource_optimization and share_ep_contexts paths, so no reset here.
 
   // Initialize compatibility manager with backend manager.
   qnn_cache_compatibility_manager_ = std::make_shared<qnn::QnnCacheCompatibilityManager>(qnn_backend_manager_.get());
@@ -2320,14 +2324,6 @@ OrtStatus* ORT_API_CALL QnnEp::GetCapabilityImpl(OrtEp* this_ptr,
   }
 
   context_bin_map.clear();
-
-  // Deferred terminator reset for both htp_share_resource_optimization and share_ep_contexts:
-  // the singleton must remain populated during SetupBackend because ContextCreateAsyncCallback
-  // retrieves the backend manager from it. Now that SetupBackend has completed it is safe to
-  // clear the slot, regardless of whether setup succeeded.
-  if (ep->stop_share_ep_contexts_) {
-    SharedContext::GetInstance().ResetSharedQnnBackendManager();
-  }
 
   if (!rt.IsOK()) {
     const std::string message = "QNN SetupBackend failed " + rt.GetErrorMessage();

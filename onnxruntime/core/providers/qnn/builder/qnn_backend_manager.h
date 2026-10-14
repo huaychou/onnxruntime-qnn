@@ -58,6 +58,23 @@ Ort::Status SetQnnContextConfig(ContextPriority context_priority, QnnContext_Con
 // Forward declaration.
 class QnnModel;
 class QnnBackendSystemDlcPlugin;
+class QnnBackendManager;
+
+// QNN retains this notifyParam for contextCreateFromBinaryListAsync callbacks. Keep the
+// initiating manager identity and node names independent of mutable process-wide shared state
+// and of the caller's context-bin map.
+struct ContextCreateAsyncCallbackInfo {
+  ContextCreateAsyncCallbackInfo(const std::shared_ptr<QnnBackendManager>& manager,
+                                 const std::vector<std::string>& node_names)
+      : backend_manager(manager), ep_node_names(node_names) {}
+
+  std::shared_ptr<QnnBackendManager> LockBackendManager() const {
+    return backend_manager.lock();
+  }
+
+  const std::weak_ptr<QnnBackendManager> backend_manager;
+  const std::vector<std::string> ep_node_names;
+};
 
 class QnnSerializerConfig {
  public:
@@ -384,12 +401,10 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
 
   QnnSerializerConfig* GetQnnSerializerConfig();
 
-  // Handler to be called upon successful context creation via contextCreateFromBinaryListAsync()
-  // This handler is expected to be called in the callback ContextCreateAsyncCallback() in the .cc file
-  // Takes in the context and the notifyParam objects received by the callback function
-  // notifyParam is expected to be a pointer to a vector of node names associated with that context handle
-  // For each node name, a mapping to the context handle will be created
-  void ProcessContextFromBinListAsync(Qnn_ContextHandle_t handle, void* notifyParam);
+  // Handler called by ContextCreateAsyncCallback after resolving the manager that initiated the
+  // request. For each node name, a mapping to the context handle will be created.
+  void ProcessContextFromBinListAsync(Qnn_ContextHandle_t handle,
+                                      const ContextCreateAsyncCallbackInfo& callback_info);
 
   // Sets the context priority to the given value, if valid
   Ort::Status SetContextPriority(ContextPriority context_priority);
@@ -754,6 +769,10 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
   // Map of EP Main Context Node names to Qnn_ContextHandle_t
   std::mutex ep_context_handle_map_mutex_;
   std::unordered_map<std::string, Qnn_ContextHandle_t> ep_context_handle_map_;
+
+  // QNN may invoke context-creation callbacks after contextCreateFromBinaryListAsync returns.
+  // Retain their notify parameters for the manager lifetime.
+  std::vector<std::unique_ptr<ContextCreateAsyncCallbackInfo>> context_create_async_callback_infos_;
 
   // Vector of Qnn_ContextHandle_t. The context handles are owned by context_map_.
   std::vector<Qnn_ContextHandle_t> contexts_;

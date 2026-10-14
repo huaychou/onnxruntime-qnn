@@ -35,7 +35,6 @@
 #include "core/providers/qnn/qnn_ep_profiler.h"
 #include "core/providers/qnn/qnn_allocator.h"
 #include "core/providers/qnn/qnn_telemetry.h"
-#include "core/providers/qnn/shared_context.h"
 #include "core/providers/qnn/qnn_external_resource_importer.h"
 
 #ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
@@ -1214,27 +1213,25 @@ static void ContextCreateAsyncCallback(Qnn_ContextHandle_t context,
                                        QnnContext_createFromBinaryAsyncNotifyType_t /* notify_type */,
                                        void* notify_param,
                                        Qnn_ErrorHandle_t /* status */) {
-  auto qnn_backend_manager = SharedContext::GetInstance().GetSharedQnnBackendManager();
+  auto* callback_info = static_cast<ContextCreateAsyncCallbackInfo*>(notify_param);
+  if (!callback_info) {
+    return;
+  }
 
-  if (context) {
-    qnn_backend_manager->ProcessContextFromBinListAsync(context, notify_param);
+  auto qnn_backend_manager = callback_info->LockBackendManager();
+  if (context && qnn_backend_manager) {
+    qnn_backend_manager->ProcessContextFromBinListAsync(context, *callback_info);
   }
 }
 
-void QnnBackendManager::ProcessContextFromBinListAsync(Qnn_ContextHandle_t context, void* notifyParam) {
+void QnnBackendManager::ProcessContextFromBinListAsync(
+    Qnn_ContextHandle_t context,
+    const ContextCreateAsyncCallbackInfo& callback_info) {
   std::ostringstream context_ss;
   context_ss << context;
 
   std::lock_guard<std::mutex> guard(ep_context_handle_map_mutex_);
-  if (!notifyParam) {
-    ORT_CXX_LOG_PTR(logger_ptr_,
-                    ORT_LOGGING_LEVEL_WARNING,
-                    ("No known node names associated with context handle: " + context_ss.str()).c_str());
-    return;
-  }
-
-  std::vector<std::string>* ep_node_names = reinterpret_cast<std::vector<std::string>*>(notifyParam);
-  for (const auto& node_name : *ep_node_names) {
+  for (const auto& node_name : callback_info.ep_node_names) {
     if (!(ep_context_handle_map_.emplace(node_name, context).second)) {
       ORT_CXX_LOG_PTR(logger_ptr_,
                       ORT_LOGGING_LEVEL_VERBOSE,
@@ -1549,12 +1546,13 @@ Ort::Status QnnBackendManager::CreateContextFromListAsync(const QnnContext_Confi
     size_t buffer_size = buffer.size();
     buffer_list.push_back(std::move(buffer));
 
+    auto callback_info = std::make_unique<ContextCreateAsyncCallbackInfo>(shared_from_this(), *it.second);
     QnnContext_ParamsV1_t context_params_v1 = {nullptr,
                                                buffer_list.back().data(),
                                                buffer_size,
                                                nullptr,
                                                ContextCreateAsyncCallback,
-                                               it.second.get()};
+                                               callback_info.get()};
 
     QnnContext_Params_t context_params = {QnnContext_ParamsVersion_t::QNN_CONTEXT_PARAMS_VERSION_1,
                                           {context_params_v1}};
@@ -1562,6 +1560,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsync(const QnnContext_Confi
     context_params_list.push_back(std::move(context_params));
     context_paramsv1_list.push_back(std::move(context_params_v1));
     context_params_ptr_list.push_back(&context_params_list.back());
+    context_create_async_callback_infos_.push_back(std::move(callback_info));
   }
   context_params_ptr_list.push_back(nullptr);
   auto result = qnn_interface_.contextCreateFromBinaryListAsync(backend_handle_,
@@ -1618,6 +1617,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsyncWithCallback(const QnnC
     }
 
     auto notify_param_ptr = std::make_unique<FileMappingCallbackInfo_t>(buffer, buffer_size, this);
+    auto callback_info = std::make_unique<ContextCreateAsyncCallbackInfo>(shared_from_this(), *it.second);
 
     Qnn_ContextBinaryCallback_t context_file_map_callbacks;
     context_file_map_callbacks.type = QNN_CONTEXT_CALLBACK_DMA_BUFFER;
@@ -1635,7 +1635,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsyncWithCallback(const QnnC
                                                buffer_size,
                                                nullptr,
                                                ContextCreateAsyncCallback,
-                                               it.second.get(),
+                                               callback_info.get(),
                                                &context_callbacks_list.back()};
 
     QnnContext_Params_t context_params = {QnnContext_ParamsVersion_t::QNN_CONTEXT_PARAMS_VERSION_2,
@@ -1646,6 +1646,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsyncWithCallback(const QnnC
     context_params.v2 = &context_paramsv2_list.back();
     context_params_list.push_back(std::move(context_params));
     context_params_ptr_list.push_back(&(context_params_list.back()));
+    context_create_async_callback_infos_.push_back(std::move(callback_info));
   }
   context_params_ptr_list.push_back(nullptr);
   auto result = qnn_interface_.contextCreateFromBinaryListAsync(backend_handle_,

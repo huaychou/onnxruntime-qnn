@@ -79,3 +79,5 @@ TEST(QnnUnit_TopK_ComponentTest, NormalizesNegativeAxisBeforeValidatingOutputRan
 
 }  // namespace test
 }  // namespace onnxruntime
+
+#endif  // !defined(ORT_MINIMAL_BUILD) && QNN_EP_INTERNAL_SYMBOL_ACCESS

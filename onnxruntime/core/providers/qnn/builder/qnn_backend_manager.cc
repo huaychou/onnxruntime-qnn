@@ -1268,11 +1268,17 @@ std::shared_ptr<ContextCreateAsyncCallbackInfo> ContextCreateAsyncCallbackInfo::
   auto& registry = GetContextCreateAsyncCallbackRegistry();
   std::lock_guard<std::mutex> lock(registry.mutex);
   auto callback_info_it = registry.entries.find(reinterpret_cast<uintptr_t>(token));
-  if (callback_info_it == registry.entries.end() || !callback_info_it->second->TryAcquire()) {
+  if (callback_info_it == registry.entries.end()) {
     return nullptr;
   }
 
-  return callback_info_it->second;
+  auto callback_info = callback_info_it->second;
+  {
+    std::lock_guard<std::mutex> callback_lock(callback_info->mutex_);
+    ++callback_info->callbacks_in_flight_;
+  }
+
+  return callback_info;
 }
 
 void ContextCreateAsyncCallbackInfo::UnregisterAndDrain(gsl::span<void* const> tokens) {
@@ -1287,7 +1293,6 @@ void ContextCreateAsyncCallbackInfo::UnregisterAndDrain(gsl::span<void* const> t
         continue;
       }
 
-      callback_info_it->second->Deactivate();
       callback_infos.push_back(std::move(callback_info_it->second));
       registry.entries.erase(callback_info_it);
     }
@@ -1304,16 +1309,6 @@ size_t ContextCreateAsyncCallbackInfo::RegistrySize() {
   return registry.entries.size();
 }
 
-bool ContextCreateAsyncCallbackInfo::TryAcquire() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!active_) {
-    return false;
-  }
-
-  ++callbacks_in_flight_;
-  return true;
-}
-
 void ContextCreateAsyncCallbackInfo::Release() {
   std::lock_guard<std::mutex> lock(mutex_);
   Expects(callbacks_in_flight_ > 0);
@@ -1321,11 +1316,6 @@ void ContextCreateAsyncCallbackInfo::Release() {
   if (callbacks_in_flight_ == 0) {
     callbacks_drained_cv_.notify_all();
   }
-}
-
-void ContextCreateAsyncCallbackInfo::Deactivate() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  active_ = false;
 }
 
 void ContextCreateAsyncCallbackInfo::WaitForCallbacks() {

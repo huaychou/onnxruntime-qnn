@@ -78,10 +78,7 @@ class ContextCreateAsyncCallbackInfo {
   static void UnregisterAndDrain(gsl::span<void* const> tokens);
   static size_t RegistrySize();
 
-  bool TryAcquire();
   void Release();
-  void Deactivate();
-  void WaitForCallbacks();
 
   std::shared_ptr<QnnBackendManager> LockBackendManager() const {
     return backend_manager_.lock();
@@ -92,12 +89,13 @@ class ContextCreateAsyncCallbackInfo {
   }
 
  private:
+  void WaitForCallbacks();
+
   const std::weak_ptr<QnnBackendManager> backend_manager_;
   const std::vector<std::string> ep_node_names_;
   std::mutex mutex_;
   std::condition_variable callbacks_drained_cv_;
   size_t callbacks_in_flight_ = 0;
-  bool active_ = true;
 };
 
 class QnnSerializerConfig {

@@ -31,6 +31,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 
@@ -252,31 +253,26 @@ TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_RegistryDoesNotG
   }
 }
 
-TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_DeactivateClosesAdmission) {
-  qnn::ContextCreateAsyncCallbackInfo callback_info(nullptr, {"node_0"});
-
-  callback_info.Deactivate();
-
-  EXPECT_FALSE(callback_info.TryAcquire());
-}
-
 TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_WaitsForAdmittedCallback) {
-  qnn::ContextCreateAsyncCallbackInfo callback_info(nullptr, {"node_0"});
-  ASSERT_TRUE(callback_info.TryAcquire());
+  void* callback_token = qnn::ContextCreateAsyncCallbackInfo::Create(nullptr, {"node_0"});
+  auto callback_info = qnn::ContextCreateAsyncCallbackInfo::Acquire(callback_token);
+  ASSERT_NE(callback_info, nullptr);
 
-  std::promise<void> drain_started;
-  auto drain_started_future = drain_started.get_future();
-  auto drain_future = std::async(std::launch::async, [&callback_info, &drain_started]() {
-    callback_info.Deactivate();
-    drain_started.set_value();
-    callback_info.WaitForCallbacks();
+  auto drain_future = std::async(std::launch::async, [&callback_token]() {
+    qnn::ContextCreateAsyncCallbackInfo::UnregisterAndDrain(gsl::make_span(&callback_token, 1));
   });
 
-  drain_started_future.wait();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (auto additional_callback = qnn::ContextCreateAsyncCallbackInfo::Acquire(callback_token)) {
+    additional_callback->Release();
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    std::this_thread::yield();
+  }
   EXPECT_EQ(drain_future.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
 
-  callback_info.Release();
+  callback_info->Release();
   EXPECT_EQ(drain_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+  EXPECT_EQ(qnn::ContextCreateAsyncCallbackInfo::Acquire(callback_token), nullptr);
 }
 
 // ---------------------------------------------------------------------------

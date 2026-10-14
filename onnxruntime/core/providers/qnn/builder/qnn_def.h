@@ -394,7 +394,9 @@ class QnnTensorWrapper {
     RETURN_IF(tensor_type == QNN_TENSOR_TYPE_STATIC,
               "QnnTensorWrapper::Init(const Qnn_Tensor_t&) does not support static initializers");
 
-    tensor_name_ = GetQnnTensorName(qnn_tensor);
+    const char* tensor_name = GetQnnTensorName(qnn_tensor);
+    RETURN_IF(tensor_name == nullptr, "Cached context tensor name is null");
+    tensor_name_ = tensor_name;
     client_buf_.clear();
 
     qnn_tensor_ = qnn_tensor;

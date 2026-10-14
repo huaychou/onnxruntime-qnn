@@ -134,7 +134,17 @@ static void RunSliceNonQDQOnHTP(const TestInputDef<DataType>& data_def,
 // CPU-EP baseline run inside RunAndVerifyOutputsWithEP), before QNN EP's own node-assignment
 // check is ever reached. Verify the expected failure so this test actively guards against silent
 // regressions (mirrors range_op_test.cc's Range_delta_zero_rejected).
+// On Linux aarch64 the test framework skips FP16/FP32 HTP tests on arch <= 68 without throwing
+// (RunQnnModelTest returns via GTEST_SKIP before the CPU baseline runs), so no EXPECT_THROW there.
 TEST_F(QnnHTPBackendTests, SliceStartsShorterThanAxesFallsBack) {
+#if defined(__linux__) && defined(__aarch64__)
+  RunSliceNonQDQOnHTP<float>(TestInputDef<float>({2, 4}, false, 0.0f, 1.0f),
+                             TestInputDef<int64_t>({1}, true, {0}),
+                             TestInputDef<int64_t>({1}, true, {2}),
+                             TestInputDef<int64_t>({2}, true, {0, 1}),
+                             TestInputDef<int64_t>({2}, true, {1, 1}),
+                             ExpectedEPNodeAssignment::None);
+#else
   EXPECT_THROW(
       RunSliceNonQDQOnHTP<float>(TestInputDef<float>({2, 4}, false, 0.0f, 1.0f),
                                  TestInputDef<int64_t>({1}, true, {0}),
@@ -143,6 +153,7 @@ TEST_F(QnnHTPBackendTests, SliceStartsShorterThanAxesFallsBack) {
                                  TestInputDef<int64_t>({2}, true, {1, 1}),
                                  ExpectedEPNodeAssignment::None),
       std::exception);
+#endif
 }
 
 TEST_F(QnnHTPBackendTests, SliceSmallDataQDQU8) {

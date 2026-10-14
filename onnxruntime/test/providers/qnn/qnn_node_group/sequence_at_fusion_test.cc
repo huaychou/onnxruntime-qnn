@@ -264,6 +264,55 @@ TEST_F(QnnHTPBackendTests, SequenceAtFusion_SingleElementSequence) {
   AssertOpInQnnGraph(json_dir, "Gather", 1);
 }
 
+// pos produced by an in-partition Add, listed before SequenceConstruct in the model.
+//
+// Exercises GetTargetNodeUnit() → SequenceAt correctness: the group must not be emitted
+// before the Add that produces pos.  Without the fix (target=SequenceConstruct) and with
+// the Add node listed first, GetQnnNodeGroupsImpl would schedule the group at the
+// SequenceConstruct position, ahead of the pos producer.
+TEST_F(QnnHTPBackendTests, SequenceAtFusion_PosFromInPartitionOp_ListedBeforeSeqConstruct) {
+  const std::filesystem::path json_dir =
+      "SequenceAtFusion_PosFromInPartitionOp_ListedBeforeSeqConstruct";
+  std::filesystem::remove_all(json_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(json_dir));
+  auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
+
+  ProviderOptions opts = GetHTPProviderOptions();
+  opts["dump_json_qnn_graph"] = "1";
+  opts["json_qnn_graph_dir"] = json_dir.string();
+
+  auto build_fn = [](ModelTestBuilder& builder) -> void {
+    // Element tensor inputs.
+    for (int i = 0; i < 3; ++i) {
+      auto def = TestInputDef<float>({2, 3}, /*is_initializer=*/false, -1.0f, 1.0f);
+      MakeTestInput(builder, "elem_" + std::to_string(i), def);
+    }
+
+    // pos_raw: dynamic int32 graph input.
+    builder.MakeInput<int32_t>("pos_raw", {}, std::vector<int32_t>{1});
+    // offset: static zero — Add(pos_raw, 0) is an identity that keeps pos dynamic.
+    builder.MakeScalarInitializer<int32_t>("offset", 0);
+
+    // *** Add is listed BEFORE SequenceConstruct in the model ***
+    // Without target=SequenceAt the group would be emitted here, before elem tensors
+    // have been registered.
+    builder.AddNode("pos_add", "Add", {"pos_raw", "offset"}, {"pos_computed"});
+
+    builder.AddNode("seq_construct", "SequenceConstruct",
+                    {"elem_0", "elem_1", "elem_2"}, {"sequence"});
+
+    builder.MakeOutput<float>("output", std::vector<int64_t>{2, 3});
+    builder.AddNode("seq_at", "SequenceAt", {"sequence", "pos_computed"}, {"output"});
+  };
+
+  RunQnnModelTest(
+      build_fn, opts, /*opset=*/11,
+      EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+
+  AssertOpInQnnGraph(json_dir, "Gather", 1);
+  AssertOpInQnnGraph(json_dir, "ElementWiseSelect", 1);  // dynamic pos normalization
+}
+
 #endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
 
 // ---------------------------------------------------------------------------

@@ -264,9 +264,12 @@ gsl::span<const OrtNodeUnit* const> SequenceAtFusion::GetNodeUnits() const {
 }
 
 const OrtNodeUnit* SequenceAtFusion::GetTargetNodeUnit() const {
-  // Use SequenceConstruct as the target so the sort-by-target-node logic in
-  // GetQnnNodeGroupsImpl emits this group at the right topological position.
-  return node_units_[0];
+  // SequenceAt is the convergence point of all input paths: the N element tensors arrive
+  // via SequenceConstruct and the position arrives directly. Using SequenceAt as the target
+  // ensures GetQnnNodeGroupsImpl emits this group only after both SequenceConstruct and any
+  // in-partition node that produces `pos` have already been emitted, regardless of the order
+  // those producer nodes appear in the model.
+  return node_units_[1];
 }
 
 Ort::Status SequenceAtFusion::IsSupported(QnnModelWrapper& qmw, const Ort::Logger& logger) const {

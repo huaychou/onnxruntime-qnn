@@ -71,9 +71,12 @@ class ContextCreateAsyncCallbackInfo {
                                  const std::vector<std::string>& node_names)
       : backend_manager_(manager), ep_node_names_(node_names) {}
 
-  static ContextCreateAsyncCallbackInfo* Create(
+  static void* Create(
       const std::shared_ptr<QnnBackendManager>& manager,
       const std::vector<std::string>& node_names);
+  static std::shared_ptr<ContextCreateAsyncCallbackInfo> Acquire(void* token);
+  static void UnregisterAndDrain(gsl::span<void* const> tokens);
+  static size_t RegistrySize();
 
   bool TryAcquire();
   void Release();
@@ -791,9 +794,9 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
   std::mutex ep_context_handle_map_mutex_;
   std::unordered_map<std::string, Qnn_ContextHandle_t> ep_context_handle_map_;
 
-  // Non-owning pointers to process-lifetime callback tombstones. Teardown deactivates and drains
-  // them before releasing context state, preventing stale asynchronous callbacks from repopulating it.
-  std::vector<ContextCreateAsyncCallbackInfo*> context_create_async_callback_infos_;
+  // Opaque, non-reused callback tokens. Teardown unregisters and drains their records before
+  // releasing context state, so late callbacks miss without retaining process-lifetime tombstones.
+  std::vector<void*> context_create_async_callback_tokens_;
 
   // Vector of Qnn_ContextHandle_t. The context handles are owned by context_map_.
   std::vector<Qnn_ContextHandle_t> contexts_;

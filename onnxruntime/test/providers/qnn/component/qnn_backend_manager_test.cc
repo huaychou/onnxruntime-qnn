@@ -221,17 +221,35 @@ TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_OwnsNodeNames) {
 }
 
 TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_OutlivesManager) {
+  const size_t initial_registry_size = qnn::ContextCreateAsyncCallbackInfo::RegistrySize();
   StubApiEnv env;
   auto manager = MakeManager(QnnHtpBackendLibraryName(), env.api_ptrs, env.logger);
   ASSERT_NE(manager, nullptr);
-  auto* callback_info = qnn::ContextCreateAsyncCallbackInfo::Create(manager, {"node_0"});
+  void* callback_token = qnn::ContextCreateAsyncCallbackInfo::Create(manager, {"node_0"});
+  auto callback_info = qnn::ContextCreateAsyncCallbackInfo::Acquire(callback_token);
+  ASSERT_NE(callback_info, nullptr);
 
   manager.reset();
 
-  ASSERT_NE(callback_info, nullptr);
   EXPECT_EQ(callback_info->LockBackendManager(), nullptr);
   ASSERT_EQ(callback_info->GetEpNodeNames().size(), 1u);
   EXPECT_EQ(callback_info->GetEpNodeNames()[0], "node_0");
+  callback_info->Release();
+  callback_info.reset();
+  qnn::ContextCreateAsyncCallbackInfo::UnregisterAndDrain(gsl::make_span(&callback_token, 1));
+  EXPECT_EQ(qnn::ContextCreateAsyncCallbackInfo::RegistrySize(), initial_registry_size);
+}
+
+TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_RegistryDoesNotGrow) {
+  const size_t initial_registry_size = qnn::ContextCreateAsyncCallbackInfo::RegistrySize();
+  std::vector<void*> callback_tokens;
+
+  for (size_t iteration = 0; iteration < 100; ++iteration) {
+    callback_tokens.push_back(qnn::ContextCreateAsyncCallbackInfo::Create(nullptr, {"node_0"}));
+    qnn::ContextCreateAsyncCallbackInfo::UnregisterAndDrain(callback_tokens);
+    callback_tokens.clear();
+    ASSERT_EQ(qnn::ContextCreateAsyncCallbackInfo::RegistrySize(), initial_registry_size);
+  }
 }
 
 TEST(QnnUnit_BackendManagerTest, ContextCreateAsyncCallbackInfo_DeactivateClosesAdmission) {

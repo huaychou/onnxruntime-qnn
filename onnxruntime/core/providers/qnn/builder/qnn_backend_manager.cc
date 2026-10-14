@@ -1213,12 +1213,8 @@ static void ContextCreateAsyncCallback(Qnn_ContextHandle_t context,
                                        QnnContext_createFromBinaryAsyncNotifyType_t /* notify_type */,
                                        void* notify_param,
                                        Qnn_ErrorHandle_t /* status */) {
-  auto* callback_info = static_cast<ContextCreateAsyncCallbackInfo*>(notify_param);
+  auto callback_info = ContextCreateAsyncCallbackInfo::Acquire(notify_param);
   if (!callback_info) {
-    return;
-  }
-
-  if (!callback_info->TryAcquire()) {
     return;
   }
 
@@ -1235,22 +1231,77 @@ static void ContextCreateAsyncCallback(Qnn_ContextHandle_t context,
   }
 }
 
-ContextCreateAsyncCallbackInfo* ContextCreateAsyncCallbackInfo::Create(
+namespace {
+
+struct ContextCreateAsyncCallbackRegistry {
+  std::mutex mutex;
+  uintptr_t next_token = 1;
+  std::unordered_map<uintptr_t, std::shared_ptr<ContextCreateAsyncCallbackInfo>> entries;
+};
+
+ContextCreateAsyncCallbackRegistry& GetContextCreateAsyncCallbackRegistry() {
+  static ContextCreateAsyncCallbackRegistry registry;
+  return registry;
+}
+
+}  // namespace
+
+void* ContextCreateAsyncCallbackInfo::Create(
     const std::shared_ptr<QnnBackendManager>& manager,
     const std::vector<std::string>& node_names) {
-  struct CallbackInfoRegistry {
-    std::mutex mutex;
-    std::vector<std::unique_ptr<ContextCreateAsyncCallbackInfo>> entries;
-  };
+  auto callback_info = std::make_shared<ContextCreateAsyncCallbackInfo>(manager, node_names);
+  auto& registry = GetContextCreateAsyncCallbackRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  if (registry.next_token == 0) {
+    throw std::runtime_error("Async context callback token space exhausted.");
+  }
+  const uintptr_t token = registry.next_token++;
+  registry.entries.emplace(token, std::move(callback_info));
+  return reinterpret_cast<void*>(token);
+}
 
-  // QNN does not expose a request handle that can be joined before manager destruction. Keep
-  // notify records as process-lifetime tombstones so a late callback can safely fail its weak lock.
-  static auto* registry = new CallbackInfoRegistry();
-  auto callback_info = std::make_unique<ContextCreateAsyncCallbackInfo>(manager, node_names);
-  auto* result = callback_info.get();
-  std::lock_guard<std::mutex> lock(registry->mutex);
-  registry->entries.push_back(std::move(callback_info));
-  return result;
+std::shared_ptr<ContextCreateAsyncCallbackInfo> ContextCreateAsyncCallbackInfo::Acquire(void* token) {
+  if (!token) {
+    return nullptr;
+  }
+
+  auto& registry = GetContextCreateAsyncCallbackRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  auto callback_info_it = registry.entries.find(reinterpret_cast<uintptr_t>(token));
+  if (callback_info_it == registry.entries.end() || !callback_info_it->second->TryAcquire()) {
+    return nullptr;
+  }
+
+  return callback_info_it->second;
+}
+
+void ContextCreateAsyncCallbackInfo::UnregisterAndDrain(gsl::span<void* const> tokens) {
+  std::vector<std::shared_ptr<ContextCreateAsyncCallbackInfo>> callback_infos;
+  auto& registry = GetContextCreateAsyncCallbackRegistry();
+  {
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    callback_infos.reserve(tokens.size());
+    for (void* token : tokens) {
+      auto callback_info_it = registry.entries.find(reinterpret_cast<uintptr_t>(token));
+      if (callback_info_it == registry.entries.end()) {
+        continue;
+      }
+
+      callback_info_it->second->Deactivate();
+      callback_infos.push_back(std::move(callback_info_it->second));
+      registry.entries.erase(callback_info_it);
+    }
+  }
+
+  for (const auto& callback_info : callback_infos) {
+    callback_info->WaitForCallbacks();
+  }
+}
+
+size_t ContextCreateAsyncCallbackInfo::RegistrySize() {
+  auto& registry = GetContextCreateAsyncCallbackRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  return registry.entries.size();
 }
 
 bool ContextCreateAsyncCallbackInfo::TryAcquire() {
@@ -1579,16 +1630,15 @@ Ort::Status QnnBackendManager::CreateContextVtcmBackupBufferSharingEnabled(
 #ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
   if (file_mapped_weights_enabled_ && file_mapper_) {
     // Retry logic -- if context creation failed with file mapped weights, then retry with feature disabled
-    const size_t callback_info_start = context_create_async_callback_infos_.size();
+    const size_t callback_token_start = context_create_async_callback_tokens_.size();
     auto res = CreateContextFromListAsyncWithCallback(configs_vec.data(), context_bin_map);
     if (!res.IsOK()) {
       ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_WARNING, (res.GetErrorMessage() + ". Retrying with feature disabled.").c_str());
-      for (size_t i = callback_info_start; i < context_create_async_callback_infos_.size(); ++i) {
-        context_create_async_callback_infos_[i]->Deactivate();
-      }
-      for (size_t i = callback_info_start; i < context_create_async_callback_infos_.size(); ++i) {
-        context_create_async_callback_infos_[i]->WaitForCallbacks();
-      }
+      ContextCreateAsyncCallbackInfo::UnregisterAndDrain(
+          gsl::make_span(context_create_async_callback_tokens_).subspan(callback_token_start));
+      context_create_async_callback_tokens_.erase(
+          context_create_async_callback_tokens_.begin() + callback_token_start,
+          context_create_async_callback_tokens_.end());
       {
         std::lock_guard<std::mutex> lock(ep_context_handle_map_mutex_);
         ep_context_handle_map_.clear();
@@ -1622,13 +1672,13 @@ Ort::Status QnnBackendManager::CreateContextFromListAsync(const QnnContext_Confi
     size_t buffer_size = buffer.size();
     buffer_list.push_back(std::move(buffer));
 
-    auto* callback_info = ContextCreateAsyncCallbackInfo::Create(shared_from_this(), *it.second);
+    void* callback_token = ContextCreateAsyncCallbackInfo::Create(shared_from_this(), *it.second);
     QnnContext_ParamsV1_t context_params_v1 = {nullptr,
                                                buffer_list.back().data(),
                                                buffer_size,
                                                nullptr,
                                                ContextCreateAsyncCallback,
-                                               callback_info};
+                                               callback_token};
 
     QnnContext_Params_t context_params = {QnnContext_ParamsVersion_t::QNN_CONTEXT_PARAMS_VERSION_1,
                                           {context_params_v1}};
@@ -1636,7 +1686,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsync(const QnnContext_Confi
     context_params_list.push_back(std::move(context_params));
     context_paramsv1_list.push_back(std::move(context_params_v1));
     context_params_ptr_list.push_back(&context_params_list.back());
-    context_create_async_callback_infos_.push_back(callback_info);
+    context_create_async_callback_tokens_.push_back(callback_token);
   }
   context_params_ptr_list.push_back(nullptr);
   auto result = qnn_interface_.contextCreateFromBinaryListAsync(backend_handle_,
@@ -1691,7 +1741,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsyncWithCallback(const QnnC
     }
 
     auto notify_param_ptr = std::make_unique<FileMappingCallbackInfo_t>(buffer, buffer_size, this);
-    auto* callback_info = ContextCreateAsyncCallbackInfo::Create(shared_from_this(), *it.second);
+    void* callback_token = ContextCreateAsyncCallbackInfo::Create(shared_from_this(), *it.second);
 
     Qnn_ContextBinaryCallback_t context_file_map_callbacks;
     context_file_map_callbacks.type = QNN_CONTEXT_CALLBACK_DMA_BUFFER;
@@ -1709,7 +1759,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsyncWithCallback(const QnnC
                                                buffer_size,
                                                nullptr,
                                                ContextCreateAsyncCallback,
-                                               callback_info,
+                                               callback_token,
                                                &context_binary_callbacks_.back()};
 
     QnnContext_Params_t context_params = {QnnContext_ParamsVersion_t::QNN_CONTEXT_PARAMS_VERSION_2,
@@ -1720,7 +1770,7 @@ Ort::Status QnnBackendManager::CreateContextFromListAsyncWithCallback(const QnnC
     context_params.v2 = &context_paramsv2_list.back();
     context_params_list.push_back(std::move(context_params));
     context_params_ptr_list.push_back(&(context_params_list.back()));
-    context_create_async_callback_infos_.push_back(callback_info);
+    context_create_async_callback_tokens_.push_back(callback_token);
   }
   context_params_ptr_list.push_back(nullptr);
   auto result = qnn_interface_.contextCreateFromBinaryListAsync(backend_handle_,
@@ -1895,12 +1945,8 @@ Ort::Status QnnBackendManager::CreateContext(bool enable_htp_weight_sharing,
 }
 
 Ort::Status QnnBackendManager::ReleaseContext() {
-  for (auto* callback_info : context_create_async_callback_infos_) {
-    callback_info->Deactivate();
-  }
-  for (auto* callback_info : context_create_async_callback_infos_) {
-    callback_info->WaitForCallbacks();
-  }
+  ContextCreateAsyncCallbackInfo::UnregisterAndDrain(context_create_async_callback_tokens_);
+  context_create_async_callback_tokens_.clear();
 
   {
     std::lock_guard<std::mutex> lock(ep_context_handle_map_mutex_);

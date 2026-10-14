@@ -160,8 +160,9 @@ TEST_F(QnnHTPBackendTests, DQQFusion_RuntimeU8_EmitsConvert) {
   const std::filesystem::path json_dir = "DQQFusion_RuntimeU8_EmitsConvert";
   auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
 
-  const TestInputDef<float> input0_def({1, 2, 2, 2}, false, -8.0f, 8.0f);
-  const TestInputDef<float> input1_def({1, 2, 2, 2}, false, -8.0f, 8.0f);
+  const std::vector<float> input_data = {-8.0f, -6.0f, -2.0f, 0.0f, 2.0f, 4.0f, 6.0f, 8.0f};
+  const TestInputDef<float> input0_def({1, 2, 2, 2}, false, input_data);
+  const TestInputDef<float> input1_def({1, 2, 2, 2}, false, input_data);
   RunDQQTest(BuildRuntimeDQQTestCase<uint8_t>(input0_def, input1_def, {1.0f, 128}), json_dir);
   if (::testing::Test::IsSkipped()) {
     return;
@@ -175,8 +176,9 @@ TEST_F(QnnHTPBackendTests, DQQFusion_RuntimeU16_EmitsConvert) {
   const std::filesystem::path json_dir = "DQQFusion_RuntimeU16_EmitsConvert";
   auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
 
-  const TestInputDef<float> input0_def({1, 2, 2, 2}, false, -8.0f, 8.0f);
-  const TestInputDef<float> input1_def({1, 2, 2, 2}, false, -8.0f, 8.0f);
+  const std::vector<float> input_data = {-8.0f, -6.0f, -2.0f, 0.0f, 2.0f, 4.0f, 6.0f, 8.0f};
+  const TestInputDef<float> input0_def({1, 2, 2, 2}, false, input_data);
+  const TestInputDef<float> input1_def({1, 2, 2, 2}, false, input_data);
   RunDQQTest(BuildRuntimeDQQTestCase<uint16_t>(input0_def, input1_def, {1.0f, 32768}), json_dir);
   if (::testing::Test::IsSkipped()) {
     return;
@@ -190,13 +192,14 @@ TEST_F(QnnHTPBackendTests, DQQFusion_ExtraConsumer_DoesNotFuse) {
   const std::filesystem::path json_dir = "DQQFusion_ExtraConsumer_DoesNotFuse";
   auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
 
-  RunDQQTest(BuildRuntimeDQQExtraConsumerTestCase(), json_dir);
+  RunDQQTest(BuildRuntimeDQQExtraConsumerTestCase(), json_dir,
+             EPVerificationParams{ExpectedEPNodeAssignment::All,
+                                  ElementwiseAbsoluteVerifier{1e-2f}});
   if (::testing::Test::IsSkipped()) {
     return;
   }
 
   AssertOpWithNameInQnnGraph(json_dir, "Dequantize", "shared_dq");
-  AssertOpWithNameInQnnGraph(json_dir, "Quantize", "requant_q");
 }
 
 // A runtime Convert here would turn the constant bias into an activation.

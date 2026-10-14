@@ -443,7 +443,8 @@ static void RunHTPPackedGQATest(int32_t num_heads,
                                 float scale,
                                 int32_t do_rotary,
                                 float fp32_abs_err = 1e-2f,
-                                int32_t max_seq_len = 0) {
+                                int32_t max_seq_len = 0,
+                                bool with_attention_bias = false) {
   // GQA op validation fails on HTP (QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE) on V68 and below.
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
 
@@ -471,6 +472,11 @@ static void RunHTPPackedGQATest(int32_t num_heads,
                                  static_cast<T>(-1.0f), static_cast<T>(1.0f));
     config.sin_cache_def.emplace(std::vector<int64_t>{max_seq_len, head_size / 2}, true,
                                  static_cast<T>(-1.0f), static_cast<T>(1.0f));
+  }
+
+  if (with_attention_bias) {
+    config.attention_bias_def.emplace(std::vector<int64_t>{batch_size, num_heads, sequence_length, total_seq_len},
+                                      false, static_cast<T>(-0.1f), static_cast<T>(0.1f));
   }
 
   config.do_rotary = do_rotary;
@@ -572,6 +578,14 @@ TEST_F(QnnHTPBackendTests, GroupQueryAttention_Llama3_AR1_FP32) {
 TEST_F(QnnHTPBackendTests, GroupQueryAttention_Rotary_FP32) {
   RunHTPPackedGQATest<float>(8, 4, 32, 1, 1024, /*scale*/ 0.0f, /*do_rotary*/ 1);
 }
+
+#if QNN_API_VERSION_MAJOR > 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 41)
+TEST_F(QnnHTPBackendTests, DISABLED_GroupQueryAttention_AttentionBias_FP32) {
+  RunHTPPackedGQATest<float>(8, 4, 32, 1, 1024, /*scale*/ 0.0f, /*do_rotary*/ 0,
+                             /*fp32_abs_err*/ 1e-2f, /*max_seq_len*/ 0, /*with_attention_bias*/ true);
+}
+#endif
 
 TEST_F(QnnHTPBackendTests, GroupQueryAttention_Basic_FP16) {
   RunHTPPackedGQATest<Ort::Float16_t>(8, 4, 32, 1, 1024, /*scale*/ 0.0f, /*do_rotary*/ 0);

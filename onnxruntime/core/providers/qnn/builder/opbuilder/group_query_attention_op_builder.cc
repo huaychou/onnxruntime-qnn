@@ -65,7 +65,12 @@ Ort::Status GroupQueryAttentionOpBuilder::IsOpSupported(QnnModelWrapper& qnn_mod
   const size_t max_num_outputs = 4;
 
   for (size_t i = 10; i < std::min(num_inputs, max_num_inputs); i++) {
-    RETURN_IF(inputs[i].Exists(), "attention_bias, head_sink, k_scale, and v_scale inputs are not supported");
+    if (i == 10) {
+      RETURN_IF(inputs[i].Exists() && backend_type != QnnBackendType::HTP,
+                "attention_bias is only supported by QNN GroupQueryAttention on HTP");
+      continue;  // attention_bias
+    }
+    RETURN_IF(inputs[i].Exists(), "head_sink, k_scale, and v_scale inputs are not supported");
   }
   RETURN_IF(num_inputs > max_num_inputs,
             ("More than " + std::to_string(max_num_inputs) + " inputs provided, which is unsupported").c_str());
@@ -85,6 +90,12 @@ Ort::Status GroupQueryAttentionOpBuilder::IsOpSupported(QnnModelWrapper& qnn_mod
   RETURN_IF(v_quant_type != "NONE", "v_quant_type != NONE not supported");
   RETURN_IF(node_helper.HasAttr("kv_cache_bit_width"),
             "kv_cache_bit_width attribute not supported");
+
+  int32_t causal = node_helper.Get("causal", 1);
+  RETURN_IF(causal != 1, "causal != 1 not supported");
+
+  int32_t sliding_window_cache = node_helper.Get("sliding_window_cache", 0);
+  RETURN_IF(sliding_window_cache != 0, "sliding_window_cache != 0 not supported");
 
   int32_t local_window_size = node_helper.Get("local_window_size", -1);
   RETURN_IF(local_window_size < -1, ("unsupported value for local_window_size: " + std::to_string(local_window_size)).c_str());
@@ -162,6 +173,14 @@ Ort::Status GroupQueryAttentionOpBuilder::ProcessInputs(QnnModelWrapper& qnn_mod
                     ("Failed to add null tensor: " + null_tensor_name).c_str());
     }
   }
+
+  // Keep the legacy 10-input signature when attention_bias is absent so existing
+  // GQA models continue to use the established HTP kernel implementation.
+  constexpr size_t kOnnxAttentionBiasIdx = 10;
+  if (onnx_inputs.size() > kOnnxAttentionBiasIdx && onnx_inputs[kOnnxAttentionBiasIdx].Exists()) {
+    RETURN_IF_ERROR(ProcessInput(qnn_model_wrapper, onnx_inputs[kOnnxAttentionBiasIdx], logger, input_names));
+  }
+
   return Ort::Status();
 }
 

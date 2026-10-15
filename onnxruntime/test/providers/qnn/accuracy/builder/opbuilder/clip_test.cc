@@ -138,6 +138,10 @@ void RunClipAccuracy(const ClipSpec& spec) {
                       EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.0f)});
       break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: {
+#if defined(_M_ARM64)
+      SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+#endif
+
       // FP16 needs FP32 reference (ORT-CPU may not have native FP16 Clip).
       // Build FP32-ref spec from same shape/min/max but FLOAT dtype.
       ClipSpec f32_ref = spec;
@@ -160,6 +164,10 @@ template <typename QType>
 void RunClipQDQFloatHelper(const ClipQDQFloatSpec& spec,
                            const TestInputDef<float>& input_def,
                            const std::vector<TestInputDef<float>>& min_max_defs) {
+#if defined(_M_ARM64)
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+#endif
+
   ProviderOptions po = MakeAccuracyProviderOptions(spec.accuracy_backend);
   auto f32_model_builder = BuildOpTestCase<float, float>(
       "Clip_node", "Clip", {input_def}, min_max_defs, /*attrs=*/{});
@@ -342,12 +350,27 @@ void RunClipQDQQuantAccuracy(const ClipQDQQuantSpec& spec) {
 // op-builder-snapshot explicit-min/max set and the session-snapshot
 // default-min/max set, so accuracy = snapshot ∪ session holds by construction
 // (see clip_specs.h).
+
+template <typename T>
+class QnnAccHtpTestBase : public ::testing::Test,
+                          public ::testing::WithParamInterface<T> {
+ protected:
+  void SetUp() override {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    Ort::Logger logger;
+    Ort::Status status = QnnHTPBackendTests::EnsurePlatformAttributes(logger);
+    ASSERT_TRUE(status.IsOK())
+        << "Failed to initialize QNN HTP platform attributes: " << status.GetErrorMessage();
+#endif
+  }
+};
+
 class QnnAcc_Clip_AccuracyTest
-    : public ::testing::TestWithParam<ClipSpec> {};
+    : public QnnAccHtpTestBase<ClipSpec> {};
 class QnnAcc_Clip_Accuracy_QDQFloatTest
-    : public ::testing::TestWithParam<ClipQDQFloatSpec> {};
+    : public QnnAccHtpTestBase<ClipQDQFloatSpec> {};
 class QnnAcc_Clip_Accuracy_QDQQuantTest
-    : public ::testing::TestWithParam<ClipQDQQuantSpec> {};
+    : public QnnAccHtpTestBase<ClipQDQQuantSpec> {};
 
 TEST_P(QnnAcc_Clip_AccuracyTest, Case) {
   RunClipAccuracy(GetParam());

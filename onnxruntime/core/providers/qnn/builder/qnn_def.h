@@ -30,11 +30,25 @@ namespace qnn {
 #define QNN_SYSTEM_DLC_API_ENABLED
 #endif  // QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 37
 
-// HTP Graph Splitting (Graph Program Executor) requires QAIRT SDK 2.49+.
+// HTP MatMul LUT is currently enabled only on Windows with QAIRT SDK 2.51+.
 // QNN_SDK_VERSION_MAJOR/MINOR are injected by CMake from the SDK version.
-#if defined(QNN_SDK_VERSION_MAJOR) && QNN_SDK_VERSION_MAJOR == 2 && \
-    defined(QNN_SDK_VERSION_MINOR) && QNN_SDK_VERSION_MINOR >= 49
+#if defined(_WIN32) && defined(QNN_SDK_VERSION_MAJOR) && defined(QNN_SDK_VERSION_MINOR) && \
+    (QNN_SDK_VERSION_MAJOR > 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR >= 51))
+#define ORT_QNN_HTP_MATMUL_LUT_SUPPORTED 1
+#else
+#define ORT_QNN_HTP_MATMUL_LUT_SUPPORTED 0
+#endif
+
+// HTP Graph Splitting (Graph Program Executor) requires QAIRT SDK 2.49+.
+#if defined(QNN_SDK_VERSION_MAJOR) && defined(QNN_SDK_VERSION_MINOR) && \
+    (QNN_SDK_VERSION_MAJOR > 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR >= 49))
 #define QNN_HTP_GRAPH_SPLITTING_AVAILABLE
+#endif
+
+// QNN_HTP_CONTEXT_CONFIG_OPTION_GRAPH_SPLITTING_NUM_PREPARE_THREADS is available from QAIRT SDK 2.51+.
+#if defined(QNN_SDK_VERSION_MAJOR) && defined(QNN_SDK_VERSION_MINOR) && \
+    (QNN_SDK_VERSION_MAJOR > 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR >= 51))
+#define QNN_HTP_GRAPH_SPLITTING_NUM_THREADS_AVAILABLE
 #endif
 
 // QNN_HTP_GRAPH_CONFIG_OPTION_FP16_CLAMP_OVERFLOW is available from QNN API 2.38
@@ -44,11 +58,44 @@ namespace qnn {
 #define QNN_HTP_FP16_CLAMP_OVERFLOW_AVAILABLE
 #endif
 
+// QNN_GROUP_QUERY_ATTENTION_AVAILABLE is available from QNN API 2.37
+// (QAIRT 2.48).
+#if QNN_API_VERSION_MAJOR > 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 37)
+#define QNN_GROUP_QUERY_ATTENTION_AVAILABLE
+#endif
+
+// QNN_HTP_GROUP_QUERY_ATTENTION_AVAILABLE is available from QNN API 2.38
+// (QAIRT 2.49).
+#if QNN_API_VERSION_MAJOR > 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 38)
+#define QNN_HTP_GROUP_QUERY_ATTENTION_AVAILABLE
+#endif
+
+// QNN_HTP_CONTEXT_CONFIG_OPTION_REUSED_IO_LIMIT is available from QAIRT 2.45
+// (QNN API 2.34).
+#if QNN_API_VERSION_MAJOR > 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 34)
+#define QNN_HTP_REUSED_IO_LIMIT_AVAILABLE
+#endif
+
 #if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
 #if QNN_API_VERSION_MAJOR > 2 || ((QNN_API_VERSION_MAJOR) == 2 && (QNN_API_VERSION_MINOR >= 32))
 #define QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
 #endif
 #endif
+
+// HTP native BQ support starts from QAIRT 2.51 (QNN API 2.40).
+#if QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40)
+#define QNN_HTP_NATIVE_BQ_AVAILABLE
+#endif  // QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40)
+
+// Cross device prepare is only available on WoS starting from QAIRT 2.51 (or QNN API 2.40).
+#if defined(_WIN32) && QNN_ARCH_ARM64
+#if QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40)
+#define QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE
+#endif  // QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40)
+#endif  // defined(_WIN32) && QNN_ARCH_ARM64
 
 // QNN only support subset of POSIX of dlopen/dlsym/dladdr/dlerror/dlclose
 // except the following flags for dlopen, others should be done only
@@ -102,11 +149,18 @@ enum class HtpPerformanceMode : uint8_t {
   kHtpExtremePowerSaver,
 };
 
+// pre_run_perf_mode and post_run_perf_mode takes precedence over default_perf_mode. If pre_run_perf_mode is set,
+// it will be used for performance setting in OnRunStart().
+// If post_run_perf_mode is set, it will be used for performance setting in OnRunDone().
+// If default_perf_mode is set and pre_run_perf_mode or post_run_perf_mode is not set,
+// default_perf_mode will be used for performance setting in both OnRunStart() and OnRunDone().
+// rpc_control_latency and rpc_polling_time will be set beforehand in OnRunStart() as it depends on the performance mode set in OnRunStart().
 typedef struct PerThreadHtpPowerConfigs {
   std::optional<HtpPerformanceMode> pre_run_perf_mode;
   std::optional<HtpPerformanceMode> post_run_perf_mode;
   std::optional<uint32_t> rpc_control_latency;
   std::optional<uint32_t> rpc_polling_time;
+  std::optional<HtpPerformanceMode> default_perf_mode;
 
   uint32_t power_config_id = 0;
 } PerThreadHtpPowerConfigs_t;
@@ -138,6 +192,8 @@ typedef struct HtpGraphConfigs {
   bool enable_htp_fp16_precision = false;
   bool enable_htp_monolithic_lstm = false;
   bool enable_htp_fp16_clamp_overflow = false;  // Intentionally undocumented; for internal/diagnostic use only.
+  bool enable_htp_matmul_lut = ORT_QNN_HTP_MATMUL_LUT_SUPPORTED;
+  uint32_t htp_num_cores = 0;
 } HtpGraphConfigs_t;
 
 enum class QnnBackendType : uint8_t {
@@ -173,16 +229,22 @@ std::string_view QnnAllocatorTypeToString(QnnAllocatorType allocator_type);
 
 std::string QnnBackendTypeToString(QnnBackendType backend_type);
 
-// constexpr config values
+// latency values are in microseconds
 constexpr const int kSleepMinLatency = 40;
 constexpr const int kSleepLowLatency = 100;
 constexpr const int kSleepMediumLatency = 1000;
 constexpr const int kSleepHighLatency = 2000;
+constexpr const int kSleepHigherLatency = 65535;
+
+// constexpr config values
 constexpr const int kDcvsDisable = 0;
 constexpr const int kDcvsEnable = 1;
 constexpr const uint32_t kDisableRpcPolling = 0;
 constexpr const uint32_t kDisableRpcControlLatency = 0;
 constexpr const uint32_t kMaxRpcPolling = 9999;
+
+// Sustained high performance mode timer timeout duration in microseconds
+constexpr const uint64_t kDefaultTimerTimeoutUs = 300000;
 
 struct OnnxTensorInfo {
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(OnnxTensorInfo);

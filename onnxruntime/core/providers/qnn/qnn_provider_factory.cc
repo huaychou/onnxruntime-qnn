@@ -19,7 +19,13 @@
 #include "core/providers/qnn/ort_api.h"
 #include "core/providers/qnn/ort_api_version_parser.h"
 #include "core/providers/qnn/qnn_allocator.h"
-#include "core/providers/qnn/soc_utils.h"
+#include "core/providers/qnn/soc_utility/soc_utils.h"
+#include "core/providers/qnn/custom_op/qnn_custom_op_domain_registry.h"
+#include "qnn_ep_min_ort_api_version.h"
+
+#ifdef _WIN32
+#include "core/providers/qnn/qnn_external_resource_importer.h"
+#endif
 
 // We allow `backend_type` (e.g., `htp`) or `backend_path` in relative path (e.g., `QnnHtp.dll`) for configurations,
 // and QnnBackendManager will later find the appropriate library and load it relative to the OnnxRuntime library.
@@ -80,11 +86,41 @@ QnnEpFactory::QnnEpFactory(const char* ep_name,
   GetSupportedDevices = GetSupportedDevicesImpl;
   CreateEp = CreateEpImpl;
   ReleaseEp = ReleaseEpImpl;
+  CreateAllocator = CreateAllocatorImpl;
   ReleaseAllocator = ReleaseAllocatorImpl;
   CreateDataTransfer = CreateDataTransferImpl;
   IsStreamAware = IsStreamAwareImpl;
   ValidateCompiledModelCompatibilityInfo = ValidateCompiledModelCompatibilityInfoImpl;
   GetHardwareDeviceIncompatibilityDetails = GetHardwareDeviceIncompatibilityDetailsImpl;
+  GetNumCustomOpDomains = GetNumCustomOpDomainsImpl;
+  GetCustomOpDomains = GetCustomOpDomainsImpl;
+
+#ifdef _WIN32
+  CreateExternalResourceImporterForDevice = CreateExternalResourceImporterForDeviceImpl;
+#else
+  CreateExternalResourceImporterForDevice = nullptr;
+#endif
+
+  // Register QNN-only placeholder ops for the qti_aisw block ops so models that use them pass ORT
+  // model validation (Graph::Resolve) when this EP is appended. Their fixed OPTIONAL schema
+  // preserves empty ONNX RNN input slots. QNN fuses/compiles supported nodes; unsupported block
+  // ops have no CPU fallback and fail during session initialization.
+  {
+    Ort::CustomOpDomain qti_aisw_domain{kQtiAiswDomain};
+    for (const char* op_type : kQtiAiswBlockOpTypes) {
+      qti_aisw_op_objects_.push_back(
+          std::make_unique<qnn::QtiAiswPlaceholderOp>(op_type, ep_name_));
+      qti_aisw_domain.Add(qti_aisw_op_objects_.back().get());
+    }
+    custom_op_domains_.push_back(std::move(qti_aisw_domain));
+  }
+
+  // Build additional custom-op domains from ORT_QNN_CUSTOM_OP_DOMAINS env var (env-var UDO ops).
+  // GetCustomOpDomains is called at SessionOptionsAppendExecutionProvider_V2 time (before CreateEp),
+  // so we parse once here at factory construction and cache the result for all sessions.
+  // SetDefaultLogger is called before factory construction in CreateEpFactories, so
+  // OrtLoggingManager::GetDefaultLoggerPtr() is already set and valid here.
+  BuildCustomOpDomainsFromEnv(OrtLoggingManager::GetDefaultLogger(), ep_name_, custom_op_domains_, custom_op_objects_);
 
   // HOST_ACCESSIBLE memory for HTP and GPU backends.
   OrtMemoryInfo* mem_info = nullptr;
@@ -98,6 +134,7 @@ QnnEpFactory::QnnEpFactory(const char* ep_name,
                                              &mem_info);
   if (status != nullptr) {
     ort_api.ReleaseMemoryInfo(mem_info);
+    ort_api.ReleaseStatus(status);
   }
   host_accessible_memory_info_ = MemoryInfoUniquePtr(mem_info, ort_api.ReleaseMemoryInfo);
 }
@@ -136,13 +173,28 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
   size_t& num_ep_devices = *p_num_ep_devices;
   num_ep_devices = 0;
 
-  auto create_ep_device = [&factory, &ep_devices, &num_ep_devices](const OrtHardwareDevice* device) {
+  auto create_ep_device = [&factory, &ep_devices, &num_ep_devices](const OrtHardwareDevice* device) -> OrtStatus* {
     OrtEpDevice* ep_device = nullptr;
-    OrtStatus* status = factory->ep_api.CreateEpDevice(factory, device, nullptr, nullptr, &ep_device);
+    RETURN_IF_NOT_NULL(factory->ep_api.CreateEpDevice(factory, device, nullptr, nullptr, &ep_device));
+
+    // Advertise HOST_ACCESSIBLE memory for NPU devices so OrtEnv can create a
+    // QnnHtpShared allocator before a QNN session exists. Loading RPCMEM is deferred
+    // until that allocator (or an opted-in session) actually needs it.
+    const auto device_type = factory->ort_api.HardwareDevice_Type(device);
+    if (device_type == OrtHardwareDeviceType_NPU &&
+        factory->host_accessible_memory_info_ != nullptr) {
+      OrtStatus* status = factory->ep_api.EpDevice_AddAllocatorInfo(
+          ep_device, factory->host_accessible_memory_info_.get());
+      if (status != nullptr) {
+        factory->ep_api.ReleaseEpDevice(ep_device);
+        return status;
+      }
+    }
+
     ep_devices[num_ep_devices++] = ep_device;
     factory->ep_devices_.push_back(ep_device);
 
-    return status;
+    return nullptr;
   };
 
   auto create_hw_device = [&factory](const OrtHardwareDeviceType device_type,
@@ -190,7 +242,8 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 
     if (synthesize_npu) {
       // ORT Core didn't enumerate an NPU OrtHardwareDevice; synthesize one.
-      // Triggers: WoS without DXCore enumeration (Makena), or Qualcomm Linux/Android arm64.
+      // Triggers: WoS without DXCore enumeration (Makena), Qualcomm Linux arm64 (/dev/fastrpc-cdsp*),
+      // or Qualcomm Android arm64 (ro.soc.manufacturer == QTI).
       OrtHardwareDevice* undetected_npu_hw_device = nullptr;
       RETURN_IF_NOT_NULL(create_hw_device(OrtHardwareDeviceType_NPU, undetected_npu_hw_device, false));
       factory->undetected_npu_hw_device_ = HardwareDeviceUniquePtr(
@@ -319,10 +372,25 @@ OrtStatus* ORT_API_CALL QnnEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
     return factory->ort_api.CreateStatus(ORT_FAIL, "Unknown exception occurred while creating QNN EP.");
   }
 
-  factory->qnn_allocator_type_ = qnn_ep->qnn_allocator_type_;
-  if (factory->qnn_allocator_type_ != qnn::QnnAllocatorType::NONE) {
+  // HOST_ACCESSIBLE memory info is optional for regular QNN sessions, but is
+  // required when a shared-memory allocator has been explicitly enabled.
+  if (qnn_ep->qnn_allocator_type_ != qnn::QnnAllocatorType::NONE &&
+      factory->host_accessible_memory_info_ == nullptr) {
+    return factory->ort_api.CreateStatus(
+        ORT_FAIL,
+        "QNN shared-memory allocator was enabled, but its HOST_ACCESSIBLE memory info could not be created.");
+  }
+
+  // Preserve the existing session-level DX12 allocator path. Unlike HTP, GPU
+  // does not advertise this memory info before session creation because the
+  // factory cannot distinguish the two allocators while they share it.
+  if (qnn::IsDx12SharedMemoryAllocator(qnn_ep->qnn_allocator_type_)) {
     for (OrtEpDevice* ep_device : factory->ep_devices_) {
-      RETURN_IF_NOT_NULL(factory->ep_api.EpDevice_AddAllocatorInfo(ep_device, factory->host_accessible_memory_info_.get()));
+      const OrtHardwareDevice* device = factory->ort_api.EpDevice_Device(ep_device);
+      if (factory->ort_api.HardwareDevice_Type(device) == OrtHardwareDeviceType_GPU) {
+        RETURN_IF_NOT_NULL(factory->ep_api.EpDevice_AddAllocatorInfo(
+            ep_device, factory->host_accessible_memory_info_.get()));
+      }
     }
   }
 
@@ -341,22 +409,44 @@ void ORT_API_CALL QnnEpFactory::ReleaseEpImpl(OrtEpFactory* /*this_ptr*/, OrtEp*
   delete dummy_ep;
 }
 
-void ORT_API_CALL QnnEpFactory::ReleaseAllocatorImpl(OrtEpFactory* this_ptr, OrtAllocator* allocator) noexcept {
+OrtStatus* ORT_API_CALL QnnEpFactory::CreateAllocatorImpl(_In_ OrtEpFactory* this_ptr,
+                                                          _In_ const OrtMemoryInfo* memory_info,
+                                                          _In_opt_ const OrtKeyValuePairs* /*allocator_options*/,
+                                                          _Outptr_result_maybenull_ OrtAllocator** allocator) noexcept {
   auto* factory = static_cast<QnnEpFactory*>(this_ptr);
+  *allocator = nullptr;
 
-  if (qnn::IsHtpSharedMemoryAllocator(factory->qnn_allocator_type_)) {
+  if (memory_info == nullptr) {
+    return nullptr;
+  }
+
+  OrtDeviceMemoryType mem_type = factory->ort_api.MemoryInfoGetDeviceMemType(memory_info);
+  if (mem_type != OrtDeviceMemoryType_HOST_ACCESSIBLE) {
+    return nullptr;
+  }
+
+  return qnn::HtpSharedMemoryAllocator::Create(factory->ort_api, memory_info, allocator);
+}
+
+void ORT_API_CALL QnnEpFactory::ReleaseAllocatorImpl(OrtEpFactory* this_ptr, OrtAllocator* allocator) noexcept {
+  if (allocator == nullptr) {
+    return;
+  }
+
+  // ORT Core releases allocators through the factory even when its preferred
+  // allocator was created by QnnEp. Dispatch by the concrete allocator callback,
+  // not factory/session state, because HTP and DX12 sessions may coexist.
+  if (allocator->Alloc == qnn::HtpSharedMemoryAllocator::AllocImpl) {
     delete static_cast<qnn::HtpSharedMemoryAllocator*>(allocator);
 #ifdef _WIN32
-  } else if (qnn::IsDx12SharedMemoryAllocator(factory->qnn_allocator_type_)) {
+  } else if (allocator->Alloc == qnn::Dx12SharedMemoryAllocator::AllocImpl) {
     delete static_cast<qnn::Dx12SharedMemoryAllocator*>(allocator);
 #endif
   } else {
-    std::ignore = factory->ort_api.Logger_LogMessage(OrtLoggingManager::GetDefaultLoggerPtr(),
-                                                     OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                     "Cannot release allocator of unknown type!",
-                                                     ORT_FILE,
-                                                     __LINE__,
-                                                     __FUNCTION__);
+    auto* factory = static_cast<QnnEpFactory*>(this_ptr);
+    std::ignore = factory->ort_api.Logger_LogMessage(
+        OrtLoggingManager::GetDefaultLoggerPtr(), OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+        "Cannot release allocator of unknown type!", ORT_FILE, __LINE__, __FUNCTION__);
   }
 }
 
@@ -501,6 +591,65 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetHardwareDeviceIncompatibilityDetailsImp
   return nullptr;
 }
 
+// External resource importer from D3D12
+OrtStatus* ORT_API_CALL QnnEpFactory::CreateExternalResourceImporterForDeviceImpl(
+    OrtEpFactory* this_ptr,
+    const OrtEpDevice* /*ep_device*/,
+    OrtExternalResourceImporterImpl** out_importer) noexcept {
+  auto* factory = static_cast<QnnEpFactory*>(this_ptr);
+
+  if (out_importer == nullptr) {
+    return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "out_importer cannot be nullptr");
+  }
+
+  *out_importer = nullptr;
+
+#ifdef _WIN32
+  // Since CreateExternalResourceImporterForDeviceImpl doesn't take memory_device
+  // as a parameter (unlike CreateSyncStreamForDeviceImpl), and we don't have direct API
+  // to extract device ID from OrtEpDevice, we currently use 0.
+  // In the future, we could extract device ID from ep_device using OrtApi::EpDevice_MemoryInfo
+  // and then query the resulting OrtMemoryInfo for device ID.
+  int device_id = 0;
+
+  // Create the external resource importer
+  try {
+    *out_importer = std::make_unique<QnnExternalResourceImporterImpl>(device_id, factory->ort_api).release();
+  } catch (...) {
+    return factory->ort_api.CreateStatus(ORT_FAIL, "Failed to create external resource importer");
+  }
+
+  return nullptr;
+#else
+  return factory->ort_api.CreateStatus(
+      ORT_NOT_IMPLEMENTED, "External resource import is not supported on non-Windows platforms");
+#endif
+}
+
+OrtStatus* ORT_API_CALL QnnEpFactory::GetNumCustomOpDomainsImpl(
+    _In_ OrtEpFactory* this_ptr,
+    _Out_ size_t* num_domains) noexcept {
+  const auto* factory = static_cast<const QnnEpFactory*>(this_ptr);
+  *num_domains = factory->custom_op_domains_.size();
+  return nullptr;
+}
+
+OrtStatus* ORT_API_CALL QnnEpFactory::GetCustomOpDomainsImpl(
+    _In_ OrtEpFactory* this_ptr,
+    _Out_writes_all_(num_domains) OrtCustomOpDomain** domains,
+    _In_ size_t num_domains) noexcept {
+  const auto* factory = static_cast<const QnnEpFactory*>(this_ptr);
+  if (num_domains > factory->custom_op_domains_.size()) {
+    return factory->ort_api.CreateStatus(
+        ORT_INVALID_ARGUMENT,
+        "GetCustomOpDomains: num_domains exceeds the value returned by GetNumCustomOpDomains");
+  }
+  for (size_t i = 0; i < num_domains; ++i) {
+    domains[i] = factory->custom_op_domains_[i];
+  }
+  return nullptr;
+}
+
 }  // namespace onnxruntime
 
 extern "C" {
@@ -517,10 +666,11 @@ OrtStatus* CreateEpFactories(const char* registration_name,
     return nullptr;
   }
 
-  // kMinOrtApiVersion must be at least the ORT API version that introduced
-  // the newest ORT API method this EP calls. Below this floor, GetApi()
-  // returns a function table missing members the EP would dereference.
-  constexpr uint32_t kMinOrtApiVersion = 24;
+  // kMinOrtApiVersion is computed at build time by
+  // qcom/scripts/all/compute_min_ort_api_version.py from \since annotations
+  // on every ORT API method this EP calls. Below this floor, GetApi() returns
+  // a function table that lacks members the EP would dereference.
+  constexpr uint32_t kMinOrtApiVersion = QNN_EP_MIN_ORT_API_VERSION;
   static_assert(kMinOrtApiVersion <= ORT_API_VERSION,
                 "kMinOrtApiVersion must not exceed ORT_API_VERSION");
 
@@ -584,6 +734,10 @@ OrtStatus* CreateEpFactories(const char* registration_name,
     return ort_api->CreateStatus(ORT_FAIL, "Failed to get Model Editor API.");
   }
 
+  // Set default logger before factory construction so that the factory ctor can read it
+  // via OrtLoggingManager::GetDefaultLoggerPtr() without needing a separate parameter.
+  onnxruntime::OrtLoggingManager::SetDefaultLogger(default_logger);
+
   // Factory could use registration_name or define its own EP name.
   std::unique_ptr<onnxruntime::QnnEpFactory> factory;
   try {
@@ -597,11 +751,9 @@ OrtStatus* CreateEpFactories(const char* registration_name,
     return ort_api->CreateStatus(ORT_FAIL, "Unknown exception occurred while creating QNN EP factory.");
   }
 
+  factory->effective_api_version_ = requested_api_version;
   factories[0] = factory.release();
   *num_factories = 1;
-
-  // Set default logger for later use.
-  onnxruntime::OrtLoggingManager::SetDefaultLogger(default_logger);
 
   return nullptr;
 }

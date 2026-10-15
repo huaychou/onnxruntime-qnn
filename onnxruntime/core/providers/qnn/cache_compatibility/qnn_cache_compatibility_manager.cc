@@ -3,6 +3,8 @@
 
 #include "core/providers/qnn/cache_compatibility/qnn_cache_compatibility_manager.h"
 
+#include <cctype>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -54,13 +56,23 @@ enum class CompatibilityInfoIndexV2 : size_t {
   SIZE  // Sentinel.
 };
 
+// Strictly parses a non-negative integer field of a compatibility info string. Unlike
+// std::stoi, this rejects leading whitespace/sign, trailing garbage, and out-of-range
+// values instead of silently truncating or throwing past the caller's Ort::Status contract.
 template <typename DType>
 Ort::Status DeserializeString(std::string_view str, /*out*/ DType& val) {
-  try {
-    val = static_cast<DType>(std::stoi(std::string(str)));
-  } catch (const std::invalid_argument& /*ex*/) {
+  if (str.empty() || !std::isdigit(static_cast<unsigned char>(str.front()))) {
     return MAKE_EP_FAIL("Unrecognized compatibility info format: malformed numeric value.");
-  } catch (const std::out_of_range& /*ex*/) {
+  }
+  try {
+    size_t pos = 0;
+    int64_t parsed = std::stoll(std::string(str), &pos);
+    if (pos != str.size() || parsed < 0 ||
+        parsed > static_cast<int64_t>(std::numeric_limits<DType>::max())) {
+      return MAKE_EP_FAIL("Unrecognized compatibility info format: malformed numeric value.");
+    }
+    val = static_cast<DType>(parsed);
+  } catch (const std::exception&) {
     return MAKE_EP_FAIL("Unrecognized compatibility info format: malformed numeric value.");
   }
   return Ort::Status();
@@ -88,9 +100,14 @@ Ort::Status GetHtpUsrDrvInfo(QnnBackendManager* qnn_backend_manager,
                              const uint32_t htp_arch,
                              /*out*/ QnnVersion& sdk_version,
                              /*out*/ bool& is_htp_usr_drv) {
-  RETURN_IF_ERROR(htp_usr_drv::IsHtpUsrDrvEnabled(qnn_backend_manager->GetBackendLibDir(),
-                                                  htp_arch,
-                                                  is_htp_usr_drv));
+  if (qnn_backend_manager->IsBackendHostMode()) {
+    // HNRD is unsupported if backend is configured to host mode.
+    is_htp_usr_drv = false;
+  } else {
+    RETURN_IF_ERROR(htp_usr_drv::IsHtpUsrDrvEnabled(qnn_backend_manager->GetBackendLibDir(),
+                                                    htp_arch,
+                                                    is_htp_usr_drv));
+  }
 
   // There is no way to query HNRD's backend API version with current APIs. Fortunately, since backend API versions are
   // bumped along with SDK versions, adopt SDK versions in HNRD scenarios, which can be extracted from driver's file
@@ -446,7 +463,8 @@ Ort::Status QnnCacheCompatibilityManager::ValidateCompatibilityInfoV2(const QnnC
       const uint32_t cache_htp_arch = cache_info.htp_archs[idx];
       const uint32_t cache_vtcm_mb = cache_info.vtcm_mbs.size() > 0 ? cache_info.vtcm_mbs[idx] : kVtcmMbUnset;
 
-      if ((cache_htp_arch < kHtpV6xAndV7xBreakageArch && runtime_htp_arch >= kHtpV6xAndV7xBreakageArch) ||
+      // Deliberately bypass unspecified cache HTP arch to allow scenario that user only provides SoC model.
+      if ((cache_htp_arch != 0 && cache_htp_arch < kHtpV6xAndV7xBreakageArch && runtime_htp_arch >= kHtpV6xAndV7xBreakageArch) ||
           cache_htp_arch > runtime_htp_arch ||
           cache_vtcm_mb > runtime_vtcm_mb) {
         cache_compatibility = OrtCompiledModelCompatibility_EP_UNSUPPORTED;

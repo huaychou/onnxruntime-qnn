@@ -15,6 +15,7 @@
 #include "HTP/QnnHtpGraph.h"
 
 #include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/builder/ep_context_io_dispatch.h"
 #include "core/providers/qnn/builder/qnn_configs_helper.h"
 #include "core/providers/qnn/builder/qnn_def.h"
 #include "core/providers/qnn/builder/qnn_model.h"
@@ -31,6 +32,7 @@
 #include "core/providers/qnn/genie/genie_api_loader.h"
 #include "core/providers/qnn/genie/genie_node.h"
 #include "core/providers/qnn/genie/genie_node_compute_info.h"
+#include "core/providers/qnn/builder/qnn_htp_power_state_guard.h"
 
 #include "QNN/QnnTypes.h"
 
@@ -45,7 +47,7 @@ class GenieBackendManager;
 
 class QnnEp : public OrtEp, public ApiPtrs {
  public:
-  QnnEp(QnnEpFactory& factory,
+  QnnEp(const QnnEpFactory& factory,
         const std::string& name,
         const OrtSessionOptions& session_options,
         const OrtLogger* logger);
@@ -92,12 +94,22 @@ class QnnEp : public OrtEp, public ApiPtrs {
   static OrtStatus* ORT_API_CALL CreateAllocatorImpl(_In_ OrtEp* this_ptr,
                                                      _In_ const OrtMemoryInfo* memory_info,
                                                      _Outptr_result_maybenull_ OrtAllocator** allocator) noexcept;
+  static OrtStatus* ORT_API_CALL GetDefaultMemoryDeviceImpl(
+      _In_ const OrtEp* this_ptr, _Outptr_result_maybenull_ const OrtMemoryDevice** device) noexcept;
   static OrtStatus* ORT_API_CALL SetDynamicOptionsImpl(_In_ OrtEp* this_ptr,
                                                        _In_reads_(num_options) const char* const* option_keys,
                                                        _In_reads_(num_options) const char* const* option_values,
                                                        _In_ size_t num_options) noexcept;
   static const char* ORT_API_CALL GetCompiledModelCompatibilityInfoImpl(_In_ OrtEp* this_ptr,
                                                                         _In_ const OrtGraph* graph) noexcept;
+#if QNN_ORT_EP_PROFILING_API_ENABLED
+  static OrtStatus* ORT_API_CALL CreateProfilerImpl(_In_ OrtEp* this_ptr,
+                                                    _Outptr_result_maybenull_ OrtEpProfilerImpl** profiler) noexcept;
+#endif
+
+  OrtStatus* ReloadCompiledContext(const OrtGraph** graphs,
+                                   const OrtNode** fused_nodes,
+                                   size_t count);
 
   OrtStatus* GetSupportedNodes(const OrtGraph* graph,
                                const std::unordered_map<const OrtNode*, const OrtNodeUnit*>& node_unit_map,
@@ -170,10 +182,6 @@ class QnnEp : public OrtEp, public ApiPtrs {
   void WarnIfHnrdPathActive();
 
   bool IsHtpSharedMemoryAllocatorAvailable() const { return rpcmem_library_ != nullptr; }
-
-  void InitQnnHtpGraphConfigs(
-      const qnn::HtpGraphConfigs_t& configs,
-      qnn::QnnConfigsBuilder<QnnGraph_Config_t, QnnHtpGraph_CustomConfig_t>& configs_builder) const;
 
   std::unique_ptr<qnn::QnnSerializerConfig> InitQnnSerializerConfig() const;
 
@@ -249,7 +257,7 @@ class QnnEp : public OrtEp, public ApiPtrs {
   // RAII guard to complete backend setup and release resource during exit.
   // This is expected to be used in GetCapability and Compile for multi-SoC EP context.
   struct ScopedPerSocQnnBackendSetup {
-    explicit ScopedPerSocQnnBackendSetup(const QnnEp& ep) : ep_(ep) {};
+    explicit ScopedPerSocQnnBackendSetup(const QnnEp& ep) : ep_(ep) {}
     ~ScopedPerSocQnnBackendSetup();
     ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(ScopedPerSocQnnBackendSetup);
 
@@ -259,8 +267,8 @@ class QnnEp : public OrtEp, public ApiPtrs {
     const QnnEp& ep_;
   };
 
-  // Will return true if any power config options need to be updated
-  bool GetPerThreadHtpPowerConfigs(qnn::PerThreadHtpPowerConfigs_t& per_thread_htp_power_configs,
+  // Retrieves per-thread HTP power configurations from run options
+  void GetPerThreadHtpPowerConfigs(qnn::PerThreadHtpPowerConfigs_t& per_thread_htp_power_configs,
                                    const ::OrtRunOptions* run_options);
 
   void CreateHtpPowerConfigId() const;
@@ -273,7 +281,8 @@ class QnnEp : public OrtEp, public ApiPtrs {
   mutable std::optional<uint32_t> htp_power_config_id_;
   mutable std::mutex config_id_mutex_;
 
-  // const QnnEpFactory& factory_;
+  const QnnEpFactory& factory_;
+
   std::string name_;
   const Ort::Logger logger_;
   bool context_cache_enabled_ = false;
@@ -287,6 +296,7 @@ class QnnEp : public OrtEp, public ApiPtrs {
   bool qnn_context_embed_mode_ = true;
   bool stop_share_ep_contexts_ = false;
   bool prepare_only_ = false;
+  bool prepare_and_load_ = false;
   bool enable_spill_fill_buffer_ = false;
   bool enable_file_mapped_weights_ = true;
 #if defined(_WIN32)
@@ -305,8 +315,10 @@ class QnnEp : public OrtEp, public ApiPtrs {
   // Configurations for HTP backend.
   uint32_t device_id_{0};
   qnn::HtpPerformanceMode default_htp_performance_mode_{qnn::HtpPerformanceMode::kHtpDefault};
+  qnn::HtpPerformanceMode dynamic_htp_performance_mode_{qnn::HtpPerformanceMode::kHtpDefault};
   uint32_t default_rpc_control_latency_ = 0;
   uint32_t default_rpc_polling_time_ = 0;
+  uint32_t dynamic_rpc_polling_time_ = 0;
   qnn::ModelSettings model_settings_ = {};
   qnn::HtpGraphConfigs_t htp_graph_configs_;
 
@@ -335,8 +347,9 @@ class QnnEp : public OrtEp, public ApiPtrs {
 
   // HTP Graph Splitting (Graph Program Executor). Requires QAIRT SDK 2.49+ at runtime.
   bool enable_htp_graph_splitting_ = false;
-  uint32_t htp_graphsplitter_num_prepare_threads_ = 8;
-  uint32_t htp_graph_splitting_kway_partitions_ = 4;  // 0 = use SDK default (do not set GPE_KWAY_PARTITIONS env var)
+  // Number of threads to prepare split subgraphs in parallel. UINT32_MAX = auto-select.
+  // Only meaningful when enable_htp_graph_splitting_ is true. Requires QAIRT SDK 2.51+.
+  uint32_t htp_graph_splitting_num_prepare_threads_ = UINT32_MAX;
 
   // --- Segmented execution (GPU fallback) ---
   bool enable_gpu_fallback_ = false;
@@ -383,6 +396,10 @@ class QnnEp : public OrtEp, public ApiPtrs {
   mutable std::shared_ptr<GenieApiLoader> genie_api_loader_;
   GenieLog_Level_t genie_log_level_ = GENIE_LOG_LEVEL_ERROR;
   mutable std::atomic<uint64_t> genie_kv_cache_rewind_{1};
+
+  // Owns the App-provided EPContext read/write callbacks.
+  // On pre-v28 ORT it degrades to a no-op stub with HasReadCallback() / HasWriteCallback() returning false.
+  std::unique_ptr<qnn::EpContextIoDispatch> io_dispatch_;
 };
 
 }  // namespace onnxruntime

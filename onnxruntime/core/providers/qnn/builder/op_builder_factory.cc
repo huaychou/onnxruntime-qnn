@@ -13,8 +13,13 @@ namespace qnn {
 OpBuilderRegistrations::OpBuilderRegistrations() {
   CreateArgMaxMinOpBuilder("ArgMax", *this);
   CreateArgMaxMinOpBuilder("ArgMin", *this);
+  CreateArrayFeatureExtractorOpBuilder("ArrayFeatureExtractor", *this);
+  CreateAttentionOpBuilder("Attention", *this);
   CreateBatchNormalizationOpBuilder("BatchNormalization", *this);
+  CreateBernoulliOpBuilder("Bernoulli", *this);
+  CreateBufferOpBuilder("Buffer", *this);
   CreateCastOpBuilder("Cast", *this);
+  CreateCastOpBuilder("CastLike", *this);
   CreateClipOpBuilder("Clip", *this);
   CreateConcatOpBuilder("Concat", *this);
   CreateConvOpBuilder("Conv", *this);
@@ -43,6 +48,7 @@ OpBuilderRegistrations::OpBuilderRegistrations() {
   CreateLSTMOpBuilder("LSTM", *this);
   CreateMatMulOpBuilder("MatMul", *this);
   CreateMatMulNBitsOpBuilder("MatMulNBits", *this);
+  CreateMaxRoiPoolOpBuilder("MaxRoiPool", *this);
   CreateMeanOpBuilder("Mean", *this);
   CreateModOpBuilder("Mod", *this);
   CreateNonMaxSuppressionOpBuilder("NonMaxSuppression", *this);
@@ -53,10 +59,14 @@ OpBuilderRegistrations::OpBuilderRegistrations() {
   CreatePoolOpBuilder("GlobalAveragePool", *this);
   CreatePoolOpBuilder("GlobalMaxPool", *this);
   CreatePoolOpBuilder("MaxPool", *this);
+  CreateQLinearConvOpBuilder("QLinearConv", *this);
   CreateQLinearMatMulOpBuilder("QLinearMatMul", *this);
+  // QuickGelu and Swish share x * sigmoid(alpha * x); the builder applies each schema's default alpha.
   CreateQuickGeluOpBuilder("QuickGelu", *this);
+  CreateQuickGeluOpBuilder("Swish", *this);
   CreateRandomNormalLikeOpBuilder("RandomNormalLike", *this);
   CreateRandomUniformLikeOpBuilder("RandomUniformLike", *this);
+  CreateRangeOpBuilder("Range", *this);
   CreateReciprocalOpBuilder("Reciprocal", *this);
   CreateReduceOpBuilder("ReduceL2", *this);
   CreateReduceOpBuilder("ReduceLogSumExp", *this);
@@ -129,6 +139,8 @@ OpBuilderRegistrations::OpBuilderRegistrations() {
   CreateSoftmaxOpBuilder("LogSoftmax", *this);
   CreateSoftmaxOpBuilder("Softmax", *this);
   CreateSplitOpBuilder("Split", *this);
+  CreateStatefulGruOpBuilder("StatefulGru", *this);
+  CreateStatefulLstmOpBuilder("StatefulLstm", *this);
   CreateSTFTOpBuilder("STFT", *this);
   CreateTanOpBuilder("Tan", *this);
   CreateThresholdedReluOpBuilder("ThresholdedRelu", *this);

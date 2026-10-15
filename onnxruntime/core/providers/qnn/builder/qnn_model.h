@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/providers/qnn/builder/ep_context_io_dispatch.h"
 #include "core/providers/qnn/builder/qnn_def.h"
 #include "core/providers/qnn/builder/qnn_model_wrapper.h"
 #include "core/providers/qnn/builder/qnn_backend_manager.h"
@@ -16,6 +17,8 @@
 
 namespace onnxruntime {
 namespace qnn {
+
+class QnnEpProfiler;
 
 struct QnnTensorInfo {
   const QnnTensorWrapper* tensor_wrapper = nullptr;
@@ -73,7 +76,16 @@ class QnnModel {
 
   Ort::Status SetupQnnInputOutput(const Ort::Logger& logger);
 
-  Ort::Status ExecuteGraph(OrtKernelContext* context, const Ort::Logger& logger);
+  // Apply runtime-settable HTP graph configs (currently fp16 clamp overflow) on an already
+  // finalized graph loaded from a context binary, via QnnGraph_setConfig. Only options confirmed
+  // settable on a finalized graph belong here; compile-time-only options must stay in
+  // QnnEp::InitQnnHtpGraphConfigs. No-op when the backend is not HTP or nothing applies.
+  Ort::Status ApplyRuntimeGraphConfigs(const HtpGraphConfigs_t& configs, const Ort::Logger& logger);
+
+  Ort::Status ExecuteGraph(OrtKernelContext* context,
+                           const Ort::Logger& logger,
+                           const qnn::EpContextIoDispatch& io_dispatch,
+                           QnnEpProfiler* ort_profiler = nullptr);
 
   Ort::Status ExecuteGraphDirect(Qnn_Tensor_t* inputs, uint32_t num_inputs,
                                  Qnn_Tensor_t* outputs, uint32_t num_outputs,
@@ -184,7 +196,7 @@ class QnnModel {
 
   // Attempt to recover from an SSR (NPU Subsystem Restart) by reloading the QNN context
   // from disk and re-initializing the graph. Only supported for embed_mode=0 models.
-  Ort::Status RecoverFromSSR(const Ort::Logger& logger);
+  Ort::Status RecoverFromSSR(const Ort::Logger& logger, const qnn::EpContextIoDispatch& io_dispatch);
 
  private:
   const OrtNodeUnit& GetNodeUnit(const OrtNode* node,
@@ -196,7 +208,15 @@ class QnnModel {
   // QNN_GRAPH_NO_ERROR on success, or another error code on other failures.
   Ort::Status BindAndExecuteGraph(OrtKernelContext* context,
                                   const Ort::Logger& logger,
-                                  Qnn_ErrorHandle_t& execute_status);
+                                  Qnn_ErrorHandle_t& execute_status,
+                                  QnnEpProfiler* ort_profiler);
+
+  Ort::Status BindQnnTensorMemoryToOrtValueMemory(const Ort::Logger& logger,
+                                                  const OrtMemoryInfo* ort_value_memory_info,
+                                                  void* ort_value_data,
+                                                  uint32_t ort_value_data_size,
+                                                  Qnn_ContextHandle_t qnn_context,
+                                                  Qnn_Tensor_t& qnn_tensor);
 
   Ort::Status SetupTensors(std::vector<QnnTensorInfo>& tensors, const std::vector<QnnTensorWrapper>& tensor_wrappers,
                            bool is_input = true);
@@ -233,6 +253,14 @@ class QnnModel {
   std::string context_bin_filepath_;
   int64_t max_spill_fill_size_ = 0;
   ContextPriority context_priority_ = ContextPriority::NORMAL;
+
+  // Runtime graph configs recorded by ApplyRuntimeGraphConfigs for re-application after an SSR
+  // re-retrieves the graph handle. See the single-call contract in the .cc.
+  HtpGraphConfigs_t runtime_graph_configs_;
+
+  // BindAndExecuteGraph is serialized by graph_exec_mutex_, so one boolean is
+  // sufficient to emit a single fallback warning for this model/session.
+  bool zero_copy_fallback_warned_ = false;
 };
 
 }  // namespace qnn

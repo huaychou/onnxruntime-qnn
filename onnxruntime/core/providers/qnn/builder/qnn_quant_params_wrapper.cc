@@ -627,20 +627,20 @@ Ort::Status QnnQuantParamsWrapper::Init(const QnnModelWrapper& qnn_model_wrapper
   } else if (is_block_quant) {
     if (!qnn_model_wrapper.GetModelSettings().enable_block_quant_weight_optimization) {
       ORT_CXX_LOG(qnn_model_wrapper.GetLogger(), ORT_LOGGING_LEVEL_VERBOSE,
-                  ("Block quant weight optimization disabled, falling back to float BQ path"));
+                  ("Block quant weight optimization disabled, BQ path is adopted as-is"));
       return Ort::Status();
     }
     // ONNX block quantization -> QNN LPBQ (BLOCKWISE_EXPANSION) conversion only supported for 4-bit.
     if (io_def.type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4) {
       ORT_CXX_LOG(qnn_model_wrapper.GetLogger(), ORT_LOGGING_LEVEL_VERBOSE,
-                  ("BQ to LPBQ conversion only supported for int4 weights, falling back to float BQ path"));
+                  ("BQ to LPBQ conversion only supported for int4 weights, falling back to BQ path"));
       return Ort::Status();
     }
     // LPBQ requires symmetric quantization (all zero-points must be zero).
     for (const int32_t zp : zero_points) {
       if (zp != 0) {
         ORT_CXX_LOG(qnn_model_wrapper.GetLogger(), ORT_LOGGING_LEVEL_VERBOSE,
-                    ("BQ to LPBQ conversion requires symmetric quantization, falling back to float BQ path"));
+                    ("BQ to LPBQ conversion requires symmetric quantization, falling back to BQ path"));
         return Ort::Status();
       }
     }
@@ -649,18 +649,6 @@ Ort::Status QnnQuantParamsWrapper::Init(const QnnModelWrapper& qnn_model_wrapper
     RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(io_def.shape, io_shape), "Cannot get shape");
     const int32_t io_rank = static_cast<int32_t>(io_shape.size());
 
-    // Get scale tensor shape to determine block/channel dimensions.
-    // Scale tensor may be rank 2 (e.g., MatMul/Gemm) or higher rank (e.g., Conv with rank-4 weights).
-    // Only the first two dimensions (indexed by onnx_axis and 1 - onnx_axis) are used for LPBQ conversion.
-    const std::vector<int64_t> scale_shape =
-        utils::GetInitializerShape(ort_quant_params->scale, qnn_model_wrapper.GetOrtApi());
-    RETURN_IF_NOT(scale_shape.size() >= 2 && scale_shape.size() <= 4,
-                  "Block quantization scale tensors must have rank between 2 and 4 for LPBQ conversion");
-    RETURN_IF_NOT(scale_shape[0] > 0 && scale_shape[1] > 0,
-                  "Block quantization scale tensor dimensions must be positive");
-    RETURN_IF_NOT(scale_shape[0] * scale_shape[1] == static_cast<int64_t>(scales.size()),
-                  "Block quantization scale tensor shape product must equal number of scales");
-
     // Determine block axis (= ONNX axis attribute).
     constexpr int64_t DEFAULT_QDQ_AXIS = 1;
     int64_t axis = ort_quant_params->axis.value_or(DEFAULT_QDQ_AXIS);
@@ -668,10 +656,31 @@ Ort::Status QnnQuantParamsWrapper::Init(const QnnModelWrapper& qnn_model_wrapper
     RETURN_IF_NOT(axis == 0 || axis == 1,
                   "Only axis 0 or 1 is supported for block quantization LPBQ conversion");
 
+    // Get scale tensor shape to determine block/channel dimensions.
+    // Scale tensor may be rank 2 (e.g., MatMul/Gemm) or higher rank (e.g., Conv with rank-4 weights).
+    // Only the first two dimensions (indexed by axis and 1 - axis) are used for LPBQ conversion.
+    const std::vector<int64_t> scale_shape =
+        utils::GetInitializerShape(ort_quant_params->scale, qnn_model_wrapper.GetOrtApi());
+    // MatMulNBits can sometimes produce rank-1 scales; other ops (MatMul, Conv, Gemm) always use rank-2+.
+    // We derive N from the weight tensor's dimension depending on axis dimension.
+    std::vector<int64_t> effective_scale_shape = scale_shape;
+    if (scale_shape.size() == 1 && !io_shape.empty() && io_rank > 1 && io_shape[1 - axis] > 0) {
+      const int64_t n = static_cast<int64_t>(io_shape[1 - axis]);
+      if (scale_shape[0] % n == 0) {
+        effective_scale_shape = {n, scale_shape[0] / n};
+      }
+    }
+    RETURN_IF_NOT(effective_scale_shape.size() >= 2 && effective_scale_shape.size() <= 4,
+                  "Block quantization scale tensors must have rank between 2 and 4 for LPBQ conversion");
+    RETURN_IF_NOT(effective_scale_shape[0] > 0 && effective_scale_shape[1] > 0,
+                  "Block quantization scale tensor dimensions must be positive");
+    RETURN_IF_NOT(effective_scale_shape[0] * effective_scale_shape[1] == static_cast<int64_t>(scales.size()),
+                  "Block quantization scale tensor shape product must equal number of scales");
+
     // Scale shape: [num_blocks_per_channel, num_channels] when axis=0
     //              [num_channels, num_blocks_per_channel] when axis=1
-    const uint32_t num_blocks_per_channel = static_cast<uint32_t>(scale_shape[axis]);
-    const uint32_t num_channels = static_cast<uint32_t>(scale_shape[1 - axis]);
+    const uint32_t num_blocks_per_channel = static_cast<uint32_t>(effective_scale_shape[axis]);
+    const uint32_t num_channels = static_cast<uint32_t>(effective_scale_shape[1 - axis]);
 
     // The conversion algorithm expects scales in block-major order [num_blocks, num_channels].
     // If axis=1 the raw tensor is channel-major [num_channels, num_blocks]; transpose it.
@@ -699,7 +708,7 @@ Ort::Status QnnQuantParamsWrapper::Init(const QnnModelWrapper& qnn_model_wrapper
                                                               per_block_int_scales, lpbq_offsets);
     if (!status.IsOK()) {
       ORT_CXX_LOG(qnn_model_wrapper.GetLogger(), ORT_LOGGING_LEVEL_VERBOSE,
-                  ("BQ to LPBQ conversion failed, falling back to float BQ path: " + std::string(status.GetErrorMessage())).c_str());
+                  ("BQ to LPBQ conversion failed, falling back to BQ path: " + std::string(status.GetErrorMessage())).c_str());
       return Ort::Status();
     }
 

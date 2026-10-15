@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <string>
 #include <thread>
+#include <memory>
 
 #include "nlohmann/json.hpp"
 
@@ -13,8 +14,8 @@
 #include "onnxruntime_cxx_api.h"
 #include "onnxruntime_session_options_config_keys.h"
 
-#include "core/providers/qnn/builder/op_package/op_package_parser.h"
 #include "core/providers/qnn/builder/qnn_ep_sanitize_utils.h"
+
 #include "test/providers/qnn/qnn_test_utils.h"
 #include "test/util/include/api_asserts.h"
 
@@ -24,6 +25,8 @@
 using namespace ONNX_NAMESPACE;
 
 #define ORT_MODEL_FOLDER ORT_TSTR("testdata/")
+// interface macro defined in combaseapi.h conflicts with its use in this file.
+#undef interface
 
 constexpr std::string_view kDlcOutputDir("dlc_output");
 
@@ -218,118 +221,6 @@ TEST(QnnEP, TestInvalidSpecificationOfBothBackendTypeAndBackendPath) {
     ASSERT_EQ(e.GetOrtErrorCode(), ORT_FAIL);
     ASSERT_THAT(e.what(), testing::HasSubstr("Only one of 'backend_type' and 'backend_path' should be set."));
   }
-}
-
-// Verifies that ParseOpPackages handles a Windows drive-letter path correctly.
-// On Windows, the colon-delimited entry contains an extra ':' from the drive letter
-// (e.g., "MyOp:C:\\path\\foo.dll:Symbol"). The parser must merge the drive letter and
-// the rest of the path into a single token without producing a dangling string_view.
-// On other platforms, the same code path is exercised with a POSIX-style path so that
-// a regression in the cross-platform parsing logic is caught everywhere.
-TEST(QnnEP, ParseOpPackages_AbsolutePath) {
-  Ort::Logger logger;
-  std::vector<onnxruntime::qnn::OpPackage> op_packages;
-
-#if defined(_WIN32)
-  // Create a real placeholder file at a Windows-style absolute path so std::filesystem::exists
-  // returns true and the drive-letter merge branch is exercised.
-  std::filesystem::path tmp_dir = std::filesystem::temp_directory_path();
-  std::filesystem::path tmp_dll = tmp_dir / "ort_qnn_parse_oppkg_test.dll";
-  std::ofstream(tmp_dll).put('\0');  // create empty placeholder
-  ASSERT_TRUE(std::filesystem::exists(tmp_dll));
-
-  const std::string entry = "MyOp:" + tmp_dll.string() + ":MyAddOpPackageInterfaceProvider";
-  onnxruntime::ParseOpPackages(entry, op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].op_type, "MyOp");
-  EXPECT_EQ(op_packages[0].path, tmp_dll.string());
-  EXPECT_EQ(op_packages[0].interface, "MyAddOpPackageInterfaceProvider");
-  EXPECT_TRUE(op_packages[0].target.empty());
-
-  // Variant with explicit ":CPU" target.
-  op_packages.clear();
-  const std::string entry_with_target = entry + ":CPU";
-  onnxruntime::ParseOpPackages(entry_with_target, op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].path, tmp_dll.string());
-  EXPECT_EQ(op_packages[0].target, "CPU");
-
-  std::filesystem::remove(tmp_dll);
-#else
-  // POSIX path — exercises the same parsing pipeline (without the Windows merge branch).
-  const std::string entry = "MyOp:/tmp/foo.so:MyAddOpPackageInterfaceProvider";
-  onnxruntime::ParseOpPackages(entry, op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].op_type, "MyOp");
-  EXPECT_EQ(op_packages[0].path, "/tmp/foo.so");
-  EXPECT_EQ(op_packages[0].interface, "MyAddOpPackageInterfaceProvider");
-  EXPECT_TRUE(op_packages[0].target.empty());
-
-  op_packages.clear();
-  onnxruntime::ParseOpPackages(entry + ":CPU", op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].target, "CPU");
-#endif
-}
-
-#if defined(_WIN32)
-// Regression test for the Windows drive-letter merge: parsing of the config string must be
-// deterministic in the input — same string → same parse, regardless of filesystem state.
-// If the merge were gated on std::filesystem::exists(), a missing DLL would silently mis-parse
-// `MyOp:C:\path\foo.dll:Symbol` as 4 tokens with "C" landing in the path slot.
-TEST(QnnEP, ParseOpPackages_AbsolutePath_NotYetOnDisk) {
-  Ort::Logger logger;
-  std::vector<onnxruntime::qnn::OpPackage> op_packages;
-
-  // Path that does NOT exist on disk — only the token shape (single-letter drive prefix) drives the merge.
-  const std::string non_existent_path = "C:\\does\\not\\exist\\ort_qnn_parse_oppkg_not_on_disk.dll";
-  ASSERT_FALSE(std::filesystem::exists(non_existent_path));
-
-  const std::string entry = "MyOp:" + non_existent_path + ":MyAddOpPackageInterfaceProvider";
-  onnxruntime::ParseOpPackages(entry, op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].op_type, "MyOp");
-  EXPECT_EQ(op_packages[0].path, non_existent_path);
-  EXPECT_EQ(op_packages[0].interface, "MyAddOpPackageInterfaceProvider");
-  EXPECT_TRUE(op_packages[0].target.empty());
-
-  // Variant with explicit ":CPU" target — the merge must leave room for the trailing target token.
-  op_packages.clear();
-  onnxruntime::ParseOpPackages(entry + ":CPU", op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].path, non_existent_path);
-  EXPECT_EQ(op_packages[0].target, "CPU");
-}
-#endif
-
-// Verifies that ParseOpPackages preserves a relative path as-is. Relative paths must NOT
-// trigger the Windows drive-letter merge branch (which is gated on splitStrings[1] being a
-// single ASCII letter), so the parser should pass the path through to op_packages unchanged.
-TEST(QnnEP, ParseOpPackages_RelativePath) {
-  Ort::Logger logger;
-  std::vector<onnxruntime::qnn::OpPackage> op_packages;
-
-#if defined(_WIN32)
-  // No drive letter → no extra ':' → no merge needed. Path passes through verbatim.
-  const std::string entry = "MyOp:foo.dll:MyAddOpPackageInterfaceProvider";
-#else
-  const std::string entry = "MyOp:foo.so:MyAddOpPackageInterfaceProvider";
-#endif
-  onnxruntime::ParseOpPackages(entry, op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].op_type, "MyOp");
-#if defined(_WIN32)
-  EXPECT_EQ(op_packages[0].path, "foo.dll");
-#else
-  EXPECT_EQ(op_packages[0].path, "foo.so");
-#endif
-  EXPECT_EQ(op_packages[0].interface, "MyAddOpPackageInterfaceProvider");
-  EXPECT_TRUE(op_packages[0].target.empty());
-
-  op_packages.clear();
-  onnxruntime::ParseOpPackages(entry + ":CPU", op_packages, logger);
-  ASSERT_EQ(op_packages.size(), 1u);
-  EXPECT_EQ(op_packages[0].target, "CPU");
 }
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
@@ -955,6 +846,56 @@ TEST_F(QnnHTPBackendTests, MultithreadDefaultHtpPowerCfgFromEpOption) {
 #endif
   options["offload_graph_io_quantization"] = "0";
   options["htp_performance_mode"] = "burst";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  Ort::SessionOptions session_opts;
+  session_opts.SetLogId("logger0");
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_opts, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), session_opts));
+
+  std::vector<std::thread> threads;
+  constexpr int num_threads = 5;
+  constexpr int loop_count = 10;
+  for (int i = 0; i < num_threads; i++) {
+    threads.push_back(std::thread(RunSessionAndVerify, std::ref(scoped.session()), Ort::RunOptions{nullptr},
+                                  std::ref(model->builder.feeds_), output_shapes, output_values, loop_count));
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+}
+
+// Tests running a single session in multiple threads on the HTP backend with EP option to set default power config to sustained high performance
+TEST_F(QnnHTPBackendTests, MultithreadSustainedHighPowerCfgFromEpOption) {
+  std::unique_ptr<ModelAndBuilder> model;
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  std::vector<int64_t> shape = {1, 3, 2};
+  std::vector<std::vector<int64_t>> output_shapes = {shape};
+  std::vector<std::vector<float>> output_values = {{3.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f}};
+
+  CreateModelInMemory(model,
+                      QDQBuildAdd3Tensors<uint8_t>(TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data)));
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+  options["htp_performance_mode"] = "sustained_high_performance";
 
 #if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
   // By default, 8 is used, which will impact time to run all
@@ -1979,285 +1920,6 @@ TEST_F(QnnGPUBackendTests, CosineSimilarityVerifier) {
                   EPVerificationParams{ExpectedEPNodeAssignment::All, CosineSimilarityVerifier(0.99f)});
 }
 
-// Returns true if QNN EP was created and QNN HTP shared memory allocator is available, false otherwise.
-static bool CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(RegisteredEpDeviceUniquePtr& registered_ep_device, const ORTCHAR_T* model_path, Ort::Session& session) {
-#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
-  constexpr bool use_htp_backend = true;
-#else
-  constexpr bool use_htp_backend = false;
-#endif
-
-#if defined(_WIN32)
-  const char* backend_path = use_htp_backend ? "QnnHtp.dll" : "QnnCpu.dll";
-#else
-  const char* backend_path = use_htp_backend ? "libQnnHtp.so" : "libQnnCpu.so";
-#endif
-
-  ProviderOptions options;
-  options["backend_path"] = backend_path;
-  options["enable_htp_shared_memory_allocator"] = "1";
-
-#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
-  // By default, 8 is used, which will impact time to run all
-  // unit tests due to overhead of thread creation/destruction
-  options["num_graph_prepare_threads"] = "1";
-#endif
-
-  Ort::SessionOptions session_options;
-  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
-
-  try {
-    session = Ort::Session{*ort_env, model_path, session_options};
-    return true;
-  } catch (const Ort::Exception& e) {
-    // handle exception that indicates that the libcdsprpc.so / dll can't be loaded
-    std::string_view error_message = e.what();
-    std::string_view expected_error_message = "Failed to initialize RPCMEM dynamic library handle";
-
-    if (e.GetOrtErrorCode() == ORT_FAIL &&
-        error_message.find(expected_error_message) != std::string_view::npos) {
-      session = Ort::Session{nullptr};
-      return false;
-    }
-
-    // propagate other exceptions
-    throw;
-  }
-}
-
-TEST_F(QnnHTPBackendTests, get_allocator_qnn_htp_shared) {
-  RegisteredEpDeviceUniquePtr registered_ep_device;
-  {
-    Ort::Session session{nullptr};
-
-    const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "capi_symbolic_dims.onnx";
-    if (!CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(registered_ep_device, ort_model_path, session)) {
-      GTEST_SKIP() << "HTP shared memory allocator is unavailable.";
-    }
-
-    Ort::MemoryInfo info_qnn_htp_shared("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
-    Ort::Allocator qnn_htp_shared_allocator(session, info_qnn_htp_shared);
-
-    auto allocator_info = qnn_htp_shared_allocator.GetInfo();
-    ASSERT_EQ(allocator_info, info_qnn_htp_shared);
-
-    void* p = qnn_htp_shared_allocator.Alloc(1024);
-    ASSERT_NE(p, nullptr);
-    qnn_htp_shared_allocator.Free(p);
-
-    auto mem_allocation = qnn_htp_shared_allocator.GetAllocation(1024);
-    ASSERT_NE(mem_allocation.get(), nullptr);
-    ASSERT_EQ(mem_allocation.size(), size_t{1024});
-  }
-}
-
-TEST_F(QnnHTPBackendTests, io_binding_qnn_htp_shared) {
-  RegisteredEpDeviceUniquePtr registered_ep_device;
-  {
-    Ort::Session session{nullptr};
-    const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
-    if (!CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(registered_ep_device, ort_model_path, session)) {
-      GTEST_SKIP() << "HTP shared memory allocator is unavailable.";
-    }
-
-    Ort::MemoryInfo info_qnn_htp_shared("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
-
-    Ort::Allocator qnn_htp_shared_allocator(session, info_qnn_htp_shared);
-    auto allocator_info = qnn_htp_shared_allocator.GetInfo();
-    ASSERT_EQ(info_qnn_htp_shared, allocator_info);
-
-    const std::array<int64_t, 2> x_shape = {3, 2};
-    std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
-    auto input_data = qnn_htp_shared_allocator.GetAllocation(x_values.size() * sizeof(float));
-    ASSERT_NE(input_data.get(), nullptr);
-    memcpy(input_data.get(), x_values.data(), sizeof(float) * x_values.size());
-
-    // Create an OrtValue tensor backed by data on QNN HTP shared memory
-    Ort::Value bound_x = Ort::Value::CreateTensor(info_qnn_htp_shared, reinterpret_cast<float*>(input_data.get()), x_values.size(),
-                                                  x_shape.data(), x_shape.size());
-
-    // Setup expected output (y) from model. Note that QNN EP runs float32 operators as float16,
-    // so the output will not be exactly equal.
-    const std::array<int64_t, 2> expected_y_shape = {3, 2};
-    const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
-    constexpr float y_max_abs_err = 1e-5f;
-    auto output_data = qnn_htp_shared_allocator.GetAllocation(expected_y.size() * sizeof(float));
-    ASSERT_NE(output_data.get(), nullptr);
-
-    // Create an OrtValue tensor backed by data on QNN HTP shared memory
-    Ort::Value bound_y = Ort::Value::CreateTensor(info_qnn_htp_shared, reinterpret_cast<float*>(output_data.get()),
-                                                  expected_y.size(), expected_y_shape.data(), expected_y_shape.size());
-
-    Ort::IoBinding binding(session);
-    binding.BindInput("X", bound_x);
-    binding.BindOutput("Y", bound_y);
-
-    session.Run(Ort::RunOptions(), binding);
-
-    // Check the values against the bound raw memory
-    {
-      gsl::span y{reinterpret_cast<const float*>(output_data.get()), expected_y.size()};
-      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
-    }
-
-    // Now compare values via GetOutputValues
-    {
-      std::vector<Ort::Value> output_values = binding.GetOutputValues();
-      ASSERT_EQ(output_values.size(), 1U);
-      const Ort::Value& Y_value = output_values[0];
-      ASSERT_TRUE(Y_value.IsTensor());
-      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
-      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
-      auto count = type_info.GetElementCount();
-      ASSERT_EQ(expected_y.size(), count);
-
-      gsl::span y{Y_value.GetTensorData<float>(), count};
-      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
-    }
-
-    {
-      std::vector<std::string> output_names = binding.GetOutputNames();
-      ASSERT_EQ(1U, output_names.size());
-      ASSERT_EQ(output_names[0].compare("Y"), 0);
-    }
-
-    // Now replace binding of Y with an on device binding instead of pre-allocated memory.
-    // This is when we can not allocate an OrtValue due to unknown dimensions
-    {
-      binding.BindOutput("Y", info_qnn_htp_shared);
-      session.Run(Ort::RunOptions(), binding);
-    }
-
-    // Check the output value allocated based on the device binding.
-    {
-      std::vector<Ort::Value> output_values = binding.GetOutputValues();
-      ASSERT_EQ(output_values.size(), 1U);
-      const Ort::Value& Y_value = output_values[0];
-      ASSERT_TRUE(Y_value.IsTensor());
-      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
-      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
-      auto count = type_info.GetElementCount();
-      ASSERT_EQ(expected_y.size(), count);
-
-      gsl::span y{Y_value.GetTensorData<float>(), count};
-      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
-    }
-
-    // Clean up
-    binding.ClearBoundInputs();
-    binding.ClearBoundOutputs();
-  }
-}
-
-TEST_F(QnnHTPBackendTests, io_binding_qnn_htp_shared_offset) {
-  RegisteredEpDeviceUniquePtr registered_ep_device;
-  {
-    Ort::Session session{nullptr};
-    const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
-    if (!CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(registered_ep_device, ort_model_path, session)) {
-      GTEST_SKIP() << "HTP shared memory allocator is unavailable.";
-    }
-
-    Ort::MemoryInfo info_qnn_htp_shared("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
-
-    Ort::Allocator qnn_htp_shared_allocator(session, info_qnn_htp_shared);
-    auto allocator_info = qnn_htp_shared_allocator.GetInfo();
-    ASSERT_EQ(info_qnn_htp_shared, allocator_info);
-
-    const std::array<int64_t, 2> x_shape = {3, 2};
-    std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
-
-    const size_t x_allocation_offset_bytes = 4 * sizeof(float);
-    const size_t x_allocation_size_bytes = x_allocation_offset_bytes + x_values.size() * sizeof(float);
-
-    auto input_data_base = qnn_htp_shared_allocator.GetAllocation(x_allocation_size_bytes);
-    ASSERT_NE(input_data_base.get(), nullptr);
-
-    auto input_data = reinterpret_cast<float*>(static_cast<uint8_t*>(input_data_base.get()) + x_allocation_offset_bytes);
-    memcpy(input_data, x_values.data(), sizeof(float) * x_values.size());
-
-    // Create an OrtValue tensor backed by data on QNN HTP shared memory
-    Ort::Value bound_x = Ort::Value::CreateTensor(info_qnn_htp_shared, input_data, x_values.size(),
-                                                  x_shape.data(), x_shape.size());
-
-    // Setup expected output (y) from model. Note that QNN EP runs float32 operators as float16,
-    // so the output will not be exactly equal.
-    const std::array<int64_t, 2> expected_y_shape = {3, 2};
-    const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
-    constexpr float y_max_abs_err = 1e-5f;
-
-    const size_t y_allocation_offset_bytes = 4 * sizeof(float);
-    const size_t y_allocation_size_bytes = y_allocation_offset_bytes + expected_y.size() * sizeof(float);
-
-    auto output_data_base = qnn_htp_shared_allocator.GetAllocation(y_allocation_size_bytes);
-    ASSERT_NE(output_data_base.get(), nullptr);
-
-    auto output_data = reinterpret_cast<float*>(static_cast<uint8_t*>(output_data_base.get()) + y_allocation_offset_bytes);
-
-    // Create an OrtValue tensor backed by data on QNN HTP shared memory
-    Ort::Value bound_y = Ort::Value::CreateTensor(info_qnn_htp_shared, output_data,
-                                                  expected_y.size(), expected_y_shape.data(), expected_y_shape.size());
-
-    Ort::IoBinding binding(session);
-    binding.BindInput("X", bound_x);
-    binding.BindOutput("Y", bound_y);
-
-    session.Run(Ort::RunOptions(), binding);
-
-    // Check the values against the bound raw memory
-    {
-      gsl::span y{output_data, expected_y.size()};
-      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
-    }
-
-    // Now compare values via GetOutputValues
-    {
-      std::vector<Ort::Value> output_values = binding.GetOutputValues();
-      ASSERT_EQ(output_values.size(), 1U);
-      const Ort::Value& Y_value = output_values[0];
-      ASSERT_TRUE(Y_value.IsTensor());
-      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
-      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
-      auto count = type_info.GetElementCount();
-      ASSERT_EQ(expected_y.size(), count);
-
-      gsl::span y{Y_value.GetTensorData<float>(), count};
-      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
-    }
-
-    {
-      std::vector<std::string> output_names = binding.GetOutputNames();
-      ASSERT_EQ(1U, output_names.size());
-      ASSERT_EQ(output_names[0].compare("Y"), 0);
-    }
-
-    // Now replace binding of Y with an on device binding instead of pre-allocated memory.
-    // This is when we can not allocate an OrtValue due to unknown dimensions
-    {
-      binding.BindOutput("Y", info_qnn_htp_shared);
-      session.Run(Ort::RunOptions(), binding);
-    }
-
-    // Check the output value allocated based on the device binding.
-    {
-      std::vector<Ort::Value> output_values = binding.GetOutputValues();
-      ASSERT_EQ(output_values.size(), 1U);
-      const Ort::Value& Y_value = output_values[0];
-      ASSERT_TRUE(Y_value.IsTensor());
-      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
-      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
-      auto count = type_info.GetElementCount();
-      ASSERT_EQ(expected_y.size(), count);
-
-      gsl::span y{Y_value.GetTensorData<float>(), count};
-      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
-    }
-
-    // Clean up
-    binding.ClearBoundInputs();
-    binding.ClearBoundOutputs();
-  }
-}
 #endif  // defined(WIN32) && !BUILD_QNN_EP_STATIC_LIB
 
 // Test whether QNN EP can handle the case where the number of graph inputs and
@@ -3236,6 +2898,362 @@ TEST_F(QnnGPUBackendTests, DISABLED_io_binding_qnn_gpu_shared_offset) {
   binding.ClearBoundOutputs();
 }
 
+/*
+ * Import external memory.
+ */
+TEST_F(QnnGPUBackendTests, import_memory_basic) {
+  ComPtr<ID3D12Device> d3d12device;
+  HRESULT hr = D3D12CreateDevice(
+      nullptr,
+      D3D_FEATURE_LEVEL_12_0,
+      IID_PPV_ARGS(&d3d12device));
+  ASSERT_FALSE(FAILED(hr) || d3d12device == nullptr);
+
+  ComPtr<ID3D12Resource> input_buffer;
+  UINT64 input_size = 16;
+  hr = CreateD3D12Buffer(
+      d3d12device.Get(),
+      input_size,
+      D3D12_HEAP_FLAG_SHARED,
+      D3D12_HEAP_TYPE_DEFAULT,
+      input_buffer.GetAddressOf());
+  ASSERT_FALSE(FAILED(hr) || input_buffer == nullptr);
+
+  HANDLE input_handle = nullptr;
+  hr = d3d12device->CreateSharedHandle(
+      input_buffer.Get(),
+      nullptr,
+      GENERIC_ALL,
+      nullptr,
+      &input_handle);
+  ASSERT_FALSE(FAILED(hr) || input_handle == nullptr);
+
+  Ort::SessionOptions session_options;
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+  ASSERT_FALSE(registered_ep_device == nullptr);
+  OrtExternalResourceImporter* importer = nullptr;
+  ASSERT_ORTSTATUS_OK(Ort::GetInteropApi().CreateExternalResourceImporterForDevice(registered_ep_device.get(), &importer));
+  ASSERT_FALSE(importer == nullptr);
+
+  bool capability = false;
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE, &capability);
+  ASSERT_TRUE(capability);
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP, &capability);
+  ASSERT_FALSE(capability);
+  Ort::GetInteropApi().CanImportSemaphore(importer, ORT_EXTERNAL_SEMAPHORE_D3D12_FENCE, &capability);
+  ASSERT_FALSE(capability);
+
+  OrtExternalMemoryDescriptor input_desc;
+  input_desc.version = ORT_API_VERSION;
+  input_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+  input_desc.native_handle = input_handle;
+  input_desc.size_bytes = input_size;
+  input_desc.offset_bytes = 0;
+  OrtExternalMemoryHandle* input_mem = nullptr;
+  Ort::GetInteropApi().ImportMemory(importer, &input_desc, &input_mem);
+  ASSERT_FALSE(input_mem == nullptr);
+
+  // cleanup
+  Ort::GetInteropApi().ReleaseExternalMemoryHandle(input_mem);
+  Ort::GetInteropApi().ReleaseExternalResourceImporter(importer);
+  CloseHandle(input_handle);
+}
+
+/*
+ * Use imported external memory for inferencing input.
+ */
+TEST_F(QnnGPUBackendTests, import_memory_inference_input) {
+  // input
+  const std::array<int64_t, 2> x_shape = {3, 2};
+  std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+
+  ComPtr<ID3D12Device> d3d12device;
+  HRESULT hr = D3D12CreateDevice(
+      nullptr,
+      D3D_FEATURE_LEVEL_12_0,
+      IID_PPV_ARGS(&d3d12device));
+  ASSERT_FALSE(FAILED(hr) || d3d12device == nullptr);
+
+  ComPtr<ID3D12Resource> input_buffer;
+  UINT64 input_size = sizeof(x_values);
+  hr = CreateD3D12Buffer(
+      d3d12device.Get(),
+      input_size,
+      D3D12_HEAP_FLAG_SHARED,
+      D3D12_HEAP_TYPE_DEFAULT,
+      input_buffer.GetAddressOf());
+  ASSERT_FALSE(FAILED(hr) || input_buffer == nullptr);
+
+  HANDLE input_handle = nullptr;
+  hr = d3d12device->CreateSharedHandle(
+      input_buffer.Get(),
+      nullptr,
+      GENERIC_ALL,
+      nullptr,
+      &input_handle);
+  ASSERT_FALSE(FAILED(hr) || input_handle == nullptr);
+
+  Ort::SessionOptions session_options;
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+  ASSERT_FALSE(registered_ep_device == nullptr);
+  OrtExternalResourceImporter* importer = nullptr;
+  ASSERT_ORTSTATUS_OK(Ort::GetInteropApi().CreateExternalResourceImporterForDevice(registered_ep_device.get(), &importer));
+  ASSERT_FALSE(importer == nullptr);
+
+  bool capability = false;
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE, &capability);
+  ASSERT_TRUE(capability);
+
+  OrtExternalMemoryDescriptor input_desc;
+  input_desc.version = ORT_API_VERSION;
+  input_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+  input_desc.native_handle = input_handle;
+  input_desc.size_bytes = input_size;
+  input_desc.offset_bytes = 0;
+  OrtExternalMemoryHandle* input_mem_handle = nullptr;
+  Ort::GetInteropApi().ImportMemory(importer, &input_desc, &input_mem_handle);
+  ASSERT_FALSE(input_mem_handle == nullptr);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+  Ort::Session session = Ort::Session{*ort_env, ort_model_path, session_options};
+
+  OrtExternalTensorDescriptor input_tensor_desc;
+  input_tensor_desc.version = ORT_API_VERSION;
+  input_tensor_desc.element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+  input_tensor_desc.shape = x_shape.data();
+  input_tensor_desc.rank = x_shape.size();
+  input_tensor_desc.offset_bytes = 0;
+  OrtValue* x_tensor = nullptr;
+  Ort::GetInteropApi().CreateTensorFromMemory(importer, input_mem_handle, &input_tensor_desc, &x_tensor);
+  ASSERT_FALSE(x_tensor == nullptr);
+
+  // Real use case imported memory would already contain input data from the gpu.
+  // Since ours doesn't we need to copy input data to it from the cpu.
+  // However it seems D3D12_HEAP_FLAG_SHARED & D3D12_HEAP_TYPE_UPLOAD does not seem to work.
+  // This means we cannot map the d3d buffer to CPU address space to copy input.
+  /*
+  {
+    void* cpu_mapped_ptr = nullptr;
+    hr = input_buffer->Map(0, nullptr, &cpu_mapped_ptr);
+    ASSERT_FALSE(FAILED(hr) || cpu_mapped_ptr == nullptr);
+    memcpy(cpu_mapped_ptr, x_values.data(), sizeof(x_values));
+  }
+  */
+
+  // Set up RunOptions
+  OrtRunOptions* run_options = nullptr;
+  Ort::GetApi().CreateRunOptions(&run_options);
+  // Run inference using simple Run() API (no IOBinding required)
+  const char* input_names[] = {"X"};
+  const char* output_names[] = {"Y"};
+  const OrtValue* inputs[] = {x_tensor};
+  OrtValue* outputs[] = {nullptr};
+  auto status = Ort::GetApi().Run(session, run_options, input_names, inputs, 1, output_names, 1, outputs);
+  ASSERT_TRUE(status == nullptr);
+
+  // check the output attributes
+  ASSERT_FALSE(outputs[0] == nullptr);
+  const auto* y_tensor = outputs[0];
+  OrtTensorTypeAndShapeInfo* y_info;
+  Ort::GetApi().GetTensorTypeAndShape(y_tensor, &y_info);
+  ASSERT_FALSE(y_info == nullptr);
+  size_t count = 0;
+  Ort::GetApi().GetTensorShapeElementCount(y_info, &count);
+  ASSERT_FALSE(count == 0);
+  const float* y = nullptr;
+  Ort::GetApi().GetTensorData(y_tensor, &(const void*)y);
+  ASSERT_FALSE(y == nullptr);
+
+  // Compare the actual output values to the expected output values.
+  // However since input values could not be provided (see above Map), we cannot compare output values.
+  /*
+  {
+    const std::array<int64_t, 2> expected_y_shape = {3, 2};
+    const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+
+    ASSERT_EQ(expected_y.size(), count);
+    constexpr float y_max_abs_err = 1e-5f;
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), gsl::span(y, count)));
+  }
+  */
+
+  // cleanup
+  Ort::GetApi().ReleaseValue(x_tensor);
+  Ort::GetInteropApi().ReleaseExternalMemoryHandle(input_mem_handle);
+  Ort::GetInteropApi().ReleaseExternalResourceImporter(importer);
+  CloseHandle(input_handle);
+}
+
+/*
+ * Use imported external memory for first inferencing output.
+ * Then use imported external memory for second inferencing input.
+ * Then compare the output values of second inferencing.
+ * Two inference need to be run this way because we cannot copy input to
+ * the imported external memory from the cpu.
+ */
+TEST_F(QnnGPUBackendTests, import_memory_inference_output_input) {
+  // ---------------------- create gpu session
+  Ort::SessionOptions session_options;
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+  ASSERT_FALSE(registered_ep_device == nullptr);
+  OrtExternalResourceImporter* importer = nullptr;
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+  Ort::Session session = Ort::Session{*ort_env, ort_model_path, session_options};
+
+  // ---------------------- prepare tensor for input stage 1
+  const std::array<int64_t, 2> x_shape = {3, 2};
+  std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  OrtValue* x_tensor = nullptr;
+  OrtMemoryInfo* meminfo = nullptr;
+  Ort::GetApi().CreateMemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeCPU, &meminfo);
+  ASSERT_FALSE(meminfo == nullptr);
+  Ort::GetApi().CreateTensorWithDataAsOrtValue(
+      meminfo, x_values.data(), sizeof(x_values), x_shape.data(), x_shape.size(),
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &x_tensor);
+
+  // ---------------------- prepare tensor for output stage 1
+  const std::array<int64_t, 2> expected_y_shape = {3, 2};
+  const std::array<float, 3 * 2> expected_y_values = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+
+  ComPtr<ID3D12Device> d3d12device;
+  HRESULT hr = D3D12CreateDevice(
+      nullptr,
+      D3D_FEATURE_LEVEL_12_0,
+      IID_PPV_ARGS(&d3d12device));
+  ASSERT_FALSE(FAILED(hr) || d3d12device == nullptr);
+
+  ComPtr<ID3D12Resource> d3d12buffer;
+  UINT64 d3d12buffer_size = sizeof(expected_y_values);
+  hr = CreateD3D12Buffer(
+      d3d12device.Get(),
+      d3d12buffer_size,
+      D3D12_HEAP_FLAG_SHARED,
+      D3D12_HEAP_TYPE_DEFAULT,
+      d3d12buffer.GetAddressOf());
+  ASSERT_FALSE(FAILED(hr) || d3d12buffer == nullptr);
+
+  HANDLE d3d12buffer_shared_handle = nullptr;
+  hr = d3d12device->CreateSharedHandle(
+      d3d12buffer.Get(),
+      nullptr,
+      GENERIC_ALL,
+      nullptr,
+      &d3d12buffer_shared_handle);
+  ASSERT_FALSE(FAILED(hr) || d3d12buffer_shared_handle == nullptr);
+
+  ASSERT_ORTSTATUS_OK(Ort::GetInteropApi().CreateExternalResourceImporterForDevice(registered_ep_device.get(), &importer));
+  ASSERT_FALSE(importer == nullptr);
+
+  bool capability = false;
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE, &capability);
+  ASSERT_TRUE(capability);
+
+  OrtExternalMemoryDescriptor import_mem_desc;
+  import_mem_desc.version = ORT_API_VERSION;
+  import_mem_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+  import_mem_desc.native_handle = d3d12buffer_shared_handle;
+  import_mem_desc.size_bytes = d3d12buffer_size;
+  import_mem_desc.offset_bytes = 0;
+  OrtExternalMemoryHandle* import_mem_handle = nullptr;
+  Ort::GetInteropApi().ImportMemory(importer, &import_mem_desc, &import_mem_handle);
+  ASSERT_FALSE(import_mem_handle == nullptr);
+
+  OrtExternalTensorDescriptor import_mem_tensor_desc;
+  import_mem_tensor_desc.version = ORT_API_VERSION;
+  import_mem_tensor_desc.element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+  import_mem_tensor_desc.shape = x_shape.data();
+  import_mem_tensor_desc.rank = x_shape.size();
+  import_mem_tensor_desc.offset_bytes = 0;
+  OrtValue* y_tensor = nullptr;
+  Ort::GetInteropApi().CreateTensorFromMemory(importer, import_mem_handle, &import_mem_tensor_desc, &y_tensor);
+  ASSERT_FALSE(y_tensor == nullptr);
+
+  // ---------------------- run inference stage 1
+  OrtRunOptions* run_options = nullptr;
+  Ort::GetApi().CreateRunOptions(&run_options);
+  // Run inference using simple Run() API (no IOBinding required)
+  const char* input_names[] = {"X"};
+  const char* output_names[] = {"Y"};
+  const OrtValue* inputs[] = {x_tensor};
+  OrtValue* outputs[] = {y_tensor};
+  auto status = Ort::GetApi().Run(session, run_options, input_names, inputs, 1, output_names, 1, outputs);
+  ASSERT_TRUE(status == nullptr);
+
+  // ---------------------- check the stage 1 run output attributes
+  ASSERT_TRUE(outputs[0] == y_tensor);
+  OrtTensorTypeAndShapeInfo* y_info;
+  Ort::GetApi().GetTensorTypeAndShape(y_tensor, &y_info);
+  ASSERT_FALSE(y_info == nullptr);
+  size_t count = 0;
+  Ort::GetApi().GetTensorShapeElementCount(y_info, &count);
+  ASSERT_FALSE(count == 0);
+  // The following cannot work because there is no cpu map of d3d12buffer.
+  /*
+  const float* y = nullptr;
+  Ort::GetApi().GetTensorData(y_tensor, &(const void*)y);
+  ASSERT_FALSE(y == nullptr);
+  */
+
+  // ---------------------- run inference stage 2
+  inputs[0] = y_tensor;
+  outputs[0] = nullptr;
+  status = Ort::GetApi().Run(session, run_options, input_names, inputs, 1, output_names, 1, outputs);
+  ASSERT_TRUE(status == nullptr);
+
+  // ---------------------- check the stage 2 run output attributes
+  ASSERT_FALSE(outputs[0] == nullptr);
+  const auto* z_tensor = outputs[0];
+  OrtTensorTypeAndShapeInfo* z_info;
+  Ort::GetApi().GetTensorTypeAndShape(z_tensor, &z_info);
+  ASSERT_FALSE(z_info == nullptr);
+  count = 0;
+  Ort::GetApi().GetTensorShapeElementCount(z_info, &count);
+  ASSERT_FALSE(count == 0);
+  const float* z = nullptr;
+  Ort::GetApi().GetTensorData(z_tensor, &(const void*)z);
+  ASSERT_FALSE(z == nullptr);
+
+  // ---------------------- Compare the actual output values to the expected output values.
+  const std::array<int64_t, 2> expected_z_shape = {3, 2};
+  const std::array<float, 3 * 2> expected_z = {1.0f, 8.0f, 27.0f, 64.0f, 125.0f, 216.0f};
+
+  ASSERT_EQ(expected_z.size(), count);
+  constexpr float z_max_abs_err = 1e-5f;
+  EXPECT_THAT(expected_z, ::testing::Pointwise(::testing::FloatNear(z_max_abs_err), gsl::span(z, count)));
+
+  // cleanup
+  Ort::GetApi().ReleaseValue(y_tensor);
+  Ort::GetInteropApi().ReleaseExternalMemoryHandle(import_mem_handle);
+  Ort::GetInteropApi().ReleaseExternalResourceImporter(importer);
+  CloseHandle(d3d12buffer_shared_handle);
+}
+
+// Test that the QNN EP can execute a graph with no runtime inputs if using the GPU backend.
+TEST_F(QnnGPUBackendTests, ConstantOnlyGraph) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "gpu";
+
+  // Float16 Abs with a constant tensor is not folded by ORT Core because it has no CPU kernel.
+  RunQnnModelTest(
+      BuildOpTestCase<Ort::Float16_t>(
+          "abs_node", "Abs",
+          {TestInputDef<Ort::Float16_t>({6}, true,
+                                        {Ort::Float16_t(-3.0f), Ort::Float16_t(-2.0f), Ort::Float16_t(-1.0f),
+                                         Ort::Float16_t(0.0f), Ort::Float16_t(1.0f), Ort::Float16_t(2.0f)})},
+          {}, {}),
+      provider_options,
+      13,
+      EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.001f)});
+}
 #endif  // defined(_WIN32) && defined(_M_ARM64) && !BUILD_QNN_EP_STATIC_LIB
 
 // ============================ QNN EP input graph dump ============================

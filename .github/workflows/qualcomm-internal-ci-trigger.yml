@@ -210,6 +210,7 @@ jobs:
     steps:
       # This handler runs from the default branch and never checks out PR code.
       - name: Report approved CI result
+        id: report
         uses: actions/github-script@v8
         with:
           script: |
@@ -251,6 +252,8 @@ jobs:
                 core.warning(`Failed to publish status for ${job.name}: ${error.message}`);
               }
             }
+            const allStatusesPublished = jobs.length > 0 && publicationFailures.length === 0;
+            core.setOutput('statuses-published', allStatusesPublished);
 
             const { data: pr } = await github.rest.pulls.get({
               ...context.repo,
@@ -273,9 +276,12 @@ jobs:
               issue_number: prNumber,
               body: `${result} for \`${approvedSha}\`. [View workflow run](${run.html_url}).${currentHeadNote}`,
             });
+            if (!allStatusesPublished) {
+              core.setFailed('One or more approved CI job statuses could not be published.');
+            }
 
       - name: Delete approved CI branch
-        if: ${{ always() }}
+        if: ${{ always() && steps.report.outputs.statuses-published == 'true' }}
         uses: actions/github-script@v8
         with:
           script: |
